@@ -1,0 +1,13 @@
+# your documents and database
+data/
+# Python
+__pycache__/
+*.pyc
+# generated exports and backups
+*.zip
+*.ics
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
