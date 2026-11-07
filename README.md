@@ -50,6 +50,12 @@ Your browser opens at `http://127.0.0.1:8765/`. Close the window or press `Ctrl+
 3. You check the details, correct anything and save. The file is stored with the document.
 4. The overview shows what is **expired**, what **expires soon** and what is fine.
 5. When you renew something, one click on its page moves the end date (+1 year, +2 years or an exact date).
+   If you set **Repeats** (every month … every 10 years), the button *Renew for the next period* moves it by
+   exactly that interval, and the calendar export shows the following periods too.
+6. **Tags** (e.g. `car, Jane`) group documents across categories; click a tag in the overview to filter.
+   Missing a category? Add your own in **Settings → Your own categories**.
+7. Things you no longer need (a sold car, a cancelled contract) go to the **Archive**: they keep their files but
+   stop showing up, stop sending reminders and leave the calendar export. You can move them back any time.
 
 The date is **never saved blindly**: you always confirm it first. Text recognition makes mistakes, especially on photos.
 
@@ -103,18 +109,24 @@ Optional installation:
 2. **Calendar on your phone (the most reliable).** On the **Export** page download an `.ics` file and open it in Google,
    Apple or Outlook calendar. Every document becomes an all-day event on its expiry date, with alerts at 9:00 the number of
    days ahead you set (default for example 60, 30, 14, 7). It is a one-time export; download it again after changes.
-3. **Desktop notifications.** `python watchdog.py notify` shows a notification when something is approaching. Each reminder
-   point (say "7 days before") is announced once, so you can run it often. Easiest is to run it **at login** or once a day:
-   - **Windows:** Task Scheduler → Create Basic Task → daily / at log on → Start a program: full path to `python.exe`,
-     arguments: `"C:\path\to\deadline-watchdog\watchdog.py" notify --quiet`, "Start in": the program folder.
-   - **Linux / macOS:** cron (`crontab -e`): `0 9 * * * cd /path/to/deadline-watchdog && python3 watchdog.py notify --quiet`.
-     Note: on Linux, cron often can't reach the graphical session; running `notify` from your desktop's startup
-     applications is more reliable.
-   - Try it with `python watchdog.py notify --test`.
+3. **Desktop notifications.** On the **Export** page click *Turn on automatic reminders* (or run
+   `python watchdog.py schedule`). The app then checks your deadlines by itself, even when it isn't open:
+   - **Windows:** a Task Scheduler task runs every day at 9:00 and when you sign in; if the computer was off at 9:00
+     it runs as soon as possible. It uses `pythonw.exe`, so no window flashes. No administrator rights are needed.
+     Notifications appear in the Windows notification centre.
+   - **macOS:** a LaunchAgent, every day at 9:00 and at log in.
+   - **Linux:** a desktop autostart entry (`~/.config/autostart`), at every log in.
+   - `python watchdog.py schedule --status` shows the state, `--remove` turns it off, `notify --test` sends a test
+     notification. Each reminder point (say "7 days before") is announced once, so running the check often is fine.
+   - If you prefer to schedule it yourself, the command is `python watchdog.py notify --quiet`.
 
 ## Backup and restore
 
 - Backup: **Export** page → *Download backup*, or `python watchdog.py backup`. The zip contains the database and all files.
+- **Automatic backup:** in **Settings → Automatic backup** choose a folder (ideally one synced to OneDrive, Dropbox…
+  or on another disk), how often to back up (default every 7 days) and how many backups to keep (default 5). The backup
+  runs while the app is open and during the daily reminder check; older automatic backups are deleted, other files in
+  the folder are never touched.
 - Restore: close the app first, then `python watchdog.py restore backup.zip --yes`. Current data is **not deleted**; it is
   moved next to it into a folder `data-before-restore-…`.
 - Data is not encrypted. Anyone with access to your user account on the computer can read it. Keep backups somewhere safe.
@@ -128,6 +140,7 @@ python watchdog.py notify [--dry-run]   announce approaching deadlines (--test =
 python watchdog.py export [file.ics]    save the calendar
 python watchdog.py backup [file.zip]    save a backup
 python watchdog.py restore file.zip --yes
+python watchdog.py schedule [--status|--remove]   check deadlines automatically every day
 python watchdog.py analyze file.pdf     show what the program reads from a document (--date-order mdy|dmy, --json)
 python watchdog.py --lang cs ...        use Czech for this run
 python watchdog.py --data D:\my-data    use another data folder (or the WATCHDOG_DATA variable)
@@ -151,15 +164,17 @@ converted automatically; nothing is deleted. The old `KEEPER_*` and `HLIDAC_*` e
 - Reading photos and scans isn't perfect, and handwriting isn't read. Always check the suggested date.
 - HEIC photos (iPhone) are stored but not read; save the photo as JPG or enter the date by hand.
 - It is a single-user app for one computer. There is no sharing or sync.
-- Verified on Linux only. The Windows and macOS launchers and desktop notifications there are written but untested;
-  the calendar export is the most reliable route.
+- Tested on Linux and Windows 11 (including the scheduled reminders and notifications). The macOS launcher and
+  LaunchAgent are written but untested there.
+- Starting the app a second time with the same data just opens the copy that is already running.
 
 ## Layout
 
 ```
 watchdog.py   commands (start, check, notify, export, backup, restore, analyze)
 web.py        web interface
-store.py      database, files, reminders, calendar, backup
+store.py      database, files, reminders, calendar, backup (also the automatic one)
+scheduler.py  desktop notifications and the daily scheduled check
 docparse.py   document reading and date finding
 i18n.py       English and Czech texts, date and number formats
 tests/        automated tests:  python -m unittest discover -s tests

@@ -111,7 +111,43 @@ def _clean_name(name: str) -> str:
     return name[:120] or "file"
 
 
-def validate_fields(title, category, expires, remind_days, note) -> dict:
+MAX_TAGS = 10
+MAX_TAG_LEN = 40
+MAX_RECUR = 120                      # months
+CUSTOM_CAT_RX = re.compile(r"^u_[0-9a-f]{8}$")
+
+
+def parse_tags(value) -> list:
+    """'Car, family ,car' -> ['Car', 'family'] (trimmed, no case-insensitive duplicates, original order)."""
+    out, seen = [], set()
+    for raw in re.split(r"[,;]+", value or ""):
+        tag = re.sub(r"\s+", " ", raw).strip().lstrip("#").strip()
+        if not tag:
+            continue
+        if len(tag) > MAX_TAG_LEN:
+            raise ValidationError("err.tag_long", n=MAX_TAG_LEN)
+        key = tag.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(tag)
+    if len(out) > MAX_TAGS:
+        raise ValidationError("err.tag_count", n=MAX_TAGS)
+    return out
+
+
+def parse_recur(value) -> int:
+    """Number of months after which the deadline repeats (0 = it doesn't)."""
+    value = str(value if value is not None else "").strip()
+    if not value:
+        return 0
+    if not value.isdigit() or int(value) > MAX_RECUR:
+        raise ValidationError("err.bad_recur")
+    return int(value)
+
+
+def validate_fields(title, category, expires, remind_days, note, tags="", recur="",
+                    categories=None) -> dict:
+    """`categories`: the category ids that may be used (default: the built-in ones)."""
     title = (title or "").strip()
     if not title:
         raise ValidationError("err.title_required")
@@ -119,7 +155,7 @@ def validate_fields(title, category, expires, remind_days, note) -> dict:
         raise ValidationError("err.title_long")
     category = (category or "other").strip()
     category = LEGACY_CATEGORIES.get(category, category)
-    if category not in CATEGORIES:
+    if category not in (categories if categories is not None else CATEGORIES):
         raise ValidationError("err.bad_category")
     exp_iso = parse_user_date(expires).isoformat() if (expires or "").strip() else None
     days = parse_remind_days(remind_days)
@@ -127,7 +163,8 @@ def validate_fields(title, category, expires, remind_days, note) -> dict:
     if len(note) > 5000:
         raise ValidationError("err.note_long")
     return {"title": title, "category": category, "expires": exp_iso,
-            "remind_days": ",".join(str(x) for x in days), "note": note}
+            "remind_days": ",".join(str(x) for x in days), "note": note,
+            "tags": ",".join(parse_tags(tags)), "recur_months": parse_recur(recur)}
 
 
 def _now() -> str:
@@ -148,7 +185,10 @@ CREATE TABLE IF NOT EXISTS documents(
     body TEXT NOT NULL DEFAULT '',
     search TEXT NOT NULL DEFAULT '',
     created TEXT NOT NULL,
-    updated TEXT NOT NULL
+    updated TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '',
+    recur_months INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS attachments(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,7 +210,18 @@ CREATE TABLE IF NOT EXISTS settings(
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS categories(
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    remind TEXT NOT NULL DEFAULT '30,14,7,1',
+    created TEXT NOT NULL
+);
 """
+# columns added after version 1.1 (older databases and backups get them when opened)
+NEW_COLUMNS = (("tags", "TEXT NOT NULL DEFAULT ''"),
+               ("recur_months", "INTEGER NOT NULL DEFAULT 0"),
+               ("archived", "INTEGER NOT NULL DEFAULT 0"))
+AUTO_BACKUP_RX = re.compile(r"^" + re.escape(i18n.APP_SLUG) + r"-auto-\d{4}-\d{2}-\d{2}-\d{6}\.zip$")
 
 
 class Store:
@@ -199,6 +250,10 @@ class Store:
         with self.conn() as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(SCHEMA)
+            have = {r["name"] for r in c.execute("PRAGMA table_info(documents)")}
+            for name, decl in NEW_COLUMNS:
+                if name not in have:
+                    c.execute(f"ALTER TABLE documents ADD COLUMN {name} {decl}")
             for old, new in LEGACY_CATEGORIES.items():
                 c.execute("UPDATE documents SET category=? WHERE category=?", (new, old))
 
@@ -250,34 +305,70 @@ class Store:
 
     # ---- documents ------------------------------------------------------------
     @staticmethod
-    def _search_blob(title: str, note: str, body: str) -> str:
+    def _search_blob(title: str, note: str, body: str, tags: str = "") -> str:
         from docparse import fold
-        return fold(f"{title}\n{note}\n{body}")
+        return fold(f"{title}\n{tags.replace(',', ' ')}\n{note}\n{body}")
+
+    def validate(self, title, category, expires, remind_days, note, tags="", recur="") -> dict:
+        return validate_fields(title, category, expires, remind_days, note, tags, recur,
+                               categories=self.categories())
 
     def add_document(self, title, category="other", expires=None, remind_days="30,14,7,1",
-                     note="", body="") -> int:
-        f = validate_fields(title, category, expires, remind_days, note)
+                     note="", body="", tags="", recur="") -> int:
+        f = self.validate(title, category, expires, remind_days, note, tags, recur)
         body = (body or "")[:MAX_BODY]
         now = _now()
         with self.conn() as c:
             cur = c.execute(
-                "INSERT INTO documents(title,category,expires,remind_days,note,body,search,created,updated)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO documents(title,category,expires,remind_days,note,body,search,created,updated,"
+                "tags,recur_months) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (f["title"], f["category"], f["expires"], f["remind_days"], f["note"], body,
-                 self._search_blob(f["title"], f["note"], body), now, now))
+                 self._search_blob(f["title"], f["note"], body, f["tags"]), now, now,
+                 f["tags"], f["recur_months"]))
             return int(cur.lastrowid)
 
-    def update_document(self, doc_id: int, title, category, expires, remind_days, note) -> None:
-        f = validate_fields(title, category, expires, remind_days, note)
+    def update_document(self, doc_id: int, title, category, expires, remind_days, note,
+                        tags=None, recur=None) -> None:
+        """tags / recur = None keeps the saved value."""
         with self.conn() as c:
-            row = c.execute("SELECT body FROM documents WHERE id=?", (doc_id,)).fetchone()
+            row = c.execute("SELECT body,tags,recur_months FROM documents WHERE id=?", (doc_id,)).fetchone()
             if row is None:
                 raise KeyError(doc_id)
+            f = self.validate(title, category, expires, remind_days, note,
+                              row["tags"] if tags is None else tags,
+                              row["recur_months"] if recur is None else recur)
             c.execute(
-                "UPDATE documents SET title=?,category=?,expires=?,remind_days=?,note=?,search=?,updated=?"
-                " WHERE id=?",
+                "UPDATE documents SET title=?,category=?,expires=?,remind_days=?,note=?,search=?,updated=?,"
+                "tags=?,recur_months=? WHERE id=?",
                 (f["title"], f["category"], f["expires"], f["remind_days"], f["note"],
-                 self._search_blob(f["title"], f["note"], row["body"]), _now(), doc_id))
+                 self._search_blob(f["title"], f["note"], row["body"], f["tags"]), _now(),
+                 f["tags"], f["recur_months"], doc_id))
+
+    def set_archived(self, doc_id: int, archived: bool) -> None:
+        with self.conn() as c:
+            cur = c.execute("UPDATE documents SET archived=?, updated=? WHERE id=?",
+                            (1 if archived else 0, _now(), doc_id))
+            if cur.rowcount == 0:
+                raise KeyError(doc_id)
+
+    def renew_by_interval(self, doc_id: int, today: Optional[dt.date] = None) -> str:
+        """Moves the end date by the document's repeat interval (as many periods as needed to reach today)."""
+        from docparse import add_months
+        today = today or dt.date.today()
+        doc = self.get_document(doc_id)
+        if doc is None:
+            raise KeyError(doc_id)
+        months = int(doc["recur_months"] or 0)
+        if months <= 0:
+            raise ValidationError("err.no_recur")
+        start = dt.date.fromisoformat(doc["expires"]) if doc["expires"] else today
+        n = 1
+        new = add_months(start, months)
+        while new < today and n < 1000:
+            n += 1
+            new = add_months(start, months * n)       # from the original date, so the 31st stays the 31st
+        self.set_expiry(doc_id, new.isoformat())
+        return new.isoformat()
 
     def set_expiry(self, doc_id: int, expires: str) -> None:
         iso = parse_user_date(expires).isoformat()
@@ -290,23 +381,91 @@ class Store:
         with self.conn() as c:
             return c.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
 
-    def list_documents(self, query: str = "", category: str = "") -> list:
+    def list_documents(self, query: str = "", category: str = "", tag: str = "",
+                       archived: Optional[bool] = False) -> list:
+        """Archived documents are left out unless archived=True (only them) or None (everything)."""
         from docparse import fold
         sql = ("SELECT d.id,d.title,d.category,d.expires,d.remind_days,d.note,d.created,d.updated,"
+               "d.tags,d.recur_months,d.archived,"
                "(SELECT COUNT(*) FROM attachments a WHERE a.doc_id=d.id) AS n_files FROM documents d")
         where, args = [], []
+        if archived is not None:
+            where.append("d.archived=?")
+            args.append(1 if archived else 0)
         for term in fold(query or "").split():
             esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             where.append("d.search LIKE ? ESCAPE '\\'")
             args.append(f"%{esc}%")
-        if category and category in CATEGORIES:
+        if category and category in self.categories():
             where.append("d.category=?")
             args.append(category)
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY (d.expires IS NULL), d.expires, d.title COLLATE NOCASE"
         with self.conn() as c:
-            return c.execute(sql, args).fetchall()
+            rows = c.execute(sql, args).fetchall()
+        if tag:
+            want = tag.strip().casefold()
+            rows = [r for r in rows if want in (t.casefold() for t in r["tags"].split(",") if t)]
+        return rows
+
+    def all_tags(self) -> list:
+        """[(tag, number of documents)] for documents that aren't archived, sorted by name."""
+        counts, names = {}, {}
+        with self.conn() as c:
+            for r in c.execute("SELECT tags FROM documents WHERE archived=0 AND tags<>''"):
+                for t in r["tags"].split(","):
+                    if t:
+                        k = t.casefold()
+                        counts[k] = counts.get(k, 0) + 1
+                        names.setdefault(k, t)
+        return [(names[k], counts[k]) for k in sorted(names, key=lambda k: names[k].casefold())]
+
+    def count_archived(self) -> int:
+        with self.conn() as c:
+            return int(c.execute("SELECT COUNT(*) FROM documents WHERE archived=1").fetchone()[0])
+
+    # ---- categories (built-in + the user's own) ------------------------------------
+    def custom_categories(self) -> list:
+        with self.conn() as c:
+            return c.execute("SELECT c.id,c.label,c.remind,"
+                             "(SELECT COUNT(*) FROM documents d WHERE d.category=c.id) AS n_docs "
+                             "FROM categories c ORDER BY c.label COLLATE NOCASE").fetchall()
+
+    def categories(self) -> dict:
+        """id -> {'remind': '60,30,...', 'label': None for built-in ones (translated) or the user's text}."""
+        out = {k: {"remind": m["remind"], "label": None} for k, m in CATEGORIES.items()}
+        for r in self.custom_categories():
+            out[r["id"]] = {"remind": r["remind"], "label": r["label"]}
+        return out
+
+    def category_labels(self, lang: str) -> dict:
+        return {k: (m["label"] or i18n.category_label(lang, k)) for k, m in self.categories().items()}
+
+    def add_category(self, label: str, remind: str = "30,14,7,1") -> str:
+        label = re.sub(r"\s+", " ", label or "").strip()
+        if not label:
+            raise ValidationError("err.cat_label_required")
+        if len(label) > 60:
+            raise ValidationError("err.cat_label_long")
+        days = ",".join(str(x) for x in parse_remind_days(remind)) or "30,14,7,1"
+        taken = {v.casefold() for lang in i18n.LANGS for v in self.category_labels(lang).values()}
+        if label.casefold() in taken:
+            raise ValidationError("err.cat_exists")
+        cat_id = "u_" + uuid.uuid4().hex[:8]
+        with self.conn() as c:
+            c.execute("INSERT INTO categories(id,label,remind,created) VALUES(?,?,?,?)",
+                      (cat_id, label, days, _now()))
+        return cat_id
+
+    def delete_category(self, cat_id: str) -> int:
+        """Deletes one of the user's categories; its documents move to 'other'. Returns how many moved."""
+        if not CUSTOM_CAT_RX.match(cat_id or ""):
+            raise KeyError(cat_id)
+        with self.conn() as c:
+            if c.execute("DELETE FROM categories WHERE id=?", (cat_id,)).rowcount == 0:
+                raise KeyError(cat_id)
+            return c.execute("UPDATE documents SET category='other' WHERE category=?", (cat_id,)).rowcount
 
     def delete_document(self, doc_id: int) -> None:
         with self.conn() as c:
@@ -448,7 +607,7 @@ class Store:
         out = []
         with self.conn() as c:
             docs = c.execute("SELECT id,title,category,expires,remind_days FROM documents "
-                             "WHERE expires IS NOT NULL ORDER BY expires").fetchall()
+                             "WHERE expires IS NOT NULL AND archived=0 ORDER BY expires").fetchall()
             for doc in docs:
                 d = days_left(doc["expires"], today)
                 done = {r["threshold"] for r in c.execute(
@@ -485,7 +644,8 @@ class Store:
             with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
                 z.write(snap, DB_NAME)
                 for p in sorted(self.files.iterdir()):
-                    if p.is_file():
+                    # only files the app stored itself – Thumbs.db, .DS_Store & co. would make the zip unrestorable
+                    if p.is_file() and _STORED_RX.fullmatch(f"files/{p.name}"):
                         z.write(p, f"files/{p.name}")
         finally:
             shutil.rmtree(snap.parent, ignore_errors=True)
@@ -506,17 +666,23 @@ class Store:
             if db_name is None:
                 raise ValidationError("err.restore_nodb")
             for n in names:
-                if n != db_name and not _STORED_RX.fullmatch(n):
-                    raise ValidationError("err.restore_unexpected", name=n)
+                if n == db_name or _STORED_RX.fullmatch(n):
+                    continue
+                if n == "files/" or (n.startswith("files/") and "/" not in n[6:] and ".." not in n
+                                     and "\\" not in n):
+                    continue                     # a folder entry or a stray system file (Thumbs.db…): skipped
+                raise ValidationError("err.restore_unexpected", name=n)
             stage = Path(tempfile.mkdtemp(prefix="restore-", dir=self.tmp))
             try:
                 if sum(i.file_size for i in z.infolist()) > 8 * 1024 ** 3:
                     raise ValidationError("err.restore_big")
                 (stage / "files").mkdir()
-                (stage / DB_NAME).write_bytes(z.read(db_name))
+                with z.open(db_name) as src, open(stage / DB_NAME, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
                 for n in names:
-                    if n.startswith("files/"):
-                        (stage / "files" / n[6:]).write_bytes(z.read(n))
+                    if _STORED_RX.fullmatch(n):
+                        with z.open(n) as src, open(stage / "files" / n[6:], "wb") as dst:
+                            shutil.copyfileobj(src, dst)
                 probe = sqlite3.connect(stage / DB_NAME)
                 try:
                     tables = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -539,6 +705,82 @@ class Store:
         self.files.mkdir(exist_ok=True)
         self._init_db()                                  # also migrates category ids of old backups
         return old
+
+    # ---- automatic backup ------------------------------------------------------------------
+    def auto_backup_config(self) -> dict:
+        def num(key, default, lo, hi):
+            try:
+                return min(max(int(self.get_setting(key, str(default))), lo), hi)
+            except (TypeError, ValueError):
+                return default
+        return {"dir": self.get_setting("autobackup_dir", "") or "",
+                "days": num("autobackup_days", 7, 1, 365),
+                "keep": num("autobackup_keep", 5, 1, 100),
+                "last": self.get_setting("autobackup_last", "") or "",
+                "error": self.get_setting("autobackup_error", "") or ""}
+
+    def set_auto_backup(self, folder: str, days, keep) -> None:
+        """Empty folder = automatic backup off."""
+        folder = (folder or "").strip().strip('"')
+        if folder:
+            path = Path(os.path.expandvars(os.path.expanduser(folder)))
+            if not path.is_absolute():
+                raise ValidationError("err.ab_relative")
+            resolved = path.resolve()
+            if resolved == self.dir or self.dir in resolved.parents:
+                raise ValidationError("err.ab_inside")
+            folder = str(path)
+        try:
+            days, keep = int(str(days).strip()), int(str(keep).strip())
+        except ValueError:
+            raise ValidationError("err.ab_numbers")
+        if not (1 <= days <= 365 and 1 <= keep <= 100):
+            raise ValidationError("err.ab_numbers")
+        self.set_setting("autobackup_dir", folder)
+        self.set_setting("autobackup_days", str(days))
+        self.set_setting("autobackup_keep", str(keep))
+        self.set_setting("autobackup_error", "")
+
+    def auto_backup_due(self, now: Optional[dt.datetime] = None) -> bool:
+        cfg = self.auto_backup_config()
+        if not cfg["dir"]:
+            return False
+        now = now or dt.datetime.now()
+        try:
+            last = dt.datetime.fromisoformat(cfg["last"])
+        except ValueError:
+            return True
+        return now - last >= dt.timedelta(days=cfg["days"]) or last > now
+
+    def run_auto_backup(self, force: bool = False, now: Optional[dt.datetime] = None) -> Optional[Path]:
+        """Saves a backup into the configured folder if one is due (or force=True), keeps the newest N.
+
+        Returns the new file, or None when nothing was due. A failure is remembered for the
+        Settings page and raised as OSError."""
+        cfg = self.auto_backup_config()
+        if not cfg["dir"] or not (force or self.auto_backup_due(now)):
+            return None
+        now = now or dt.datetime.now()
+        folder = Path(cfg["dir"])
+        dest = folder / f"{i18n.APP_SLUG}-auto-{now:%Y-%m-%d-%H%M%S}.zip"
+        part = folder / (dest.name + ".part")
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            self.backup_to(part)
+            os.replace(part, dest)
+            ours = sorted(p for p in folder.iterdir() if p.is_file() and AUTO_BACKUP_RX.match(p.name))
+            for p in ours[:-cfg["keep"]]:
+                with contextlib.suppress(OSError):
+                    p.unlink()
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                part.unlink()
+            with contextlib.suppress(sqlite3.Error):
+                self.set_setting("autobackup_error", f"{now:%Y-%m-%d %H:%M} – {e}")
+            raise
+        self.set_setting("autobackup_last", now.replace(microsecond=0).isoformat(sep=" "))
+        self.set_setting("autobackup_error", "")
+        return dest
 
 
 # --------------------------------------------------------------------------
@@ -572,8 +814,17 @@ def _alarm_trigger(days: int) -> str:
     return f"-P{days - 1}DT15H"
 
 
+def _rrule(months: int) -> Optional[str]:
+    if not months:
+        return None
+    if months % 12 == 0:
+        return f"RRULE:FREQ=YEARLY;INTERVAL={months // 12}"
+    return f"RRULE:FREQ=MONTHLY;INTERVAL={months}"
+
+
 def build_ics(docs, today: Optional[dt.date] = None, now: Optional[dt.datetime] = None,
-              lang: str = "en") -> str:
+              lang: str = "en", labels: Optional[dict] = None) -> str:
+    """`labels`: category id -> label, for the user's own categories (Store.category_labels)."""
     now = now or dt.datetime.now(dt.timezone.utc)
     stamp = now.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", f"PRODID:-//{i18n.APP_NAME}//EN", "CALSCALE:GREGORIAN",
@@ -583,7 +834,10 @@ def build_ics(docs, today: Optional[dt.date] = None, now: Optional[dt.datetime] 
             continue
         start = dt.date.fromisoformat(doc["expires"])
         cat_key = LEGACY_CATEGORIES.get(doc["category"], doc["category"])
-        label = i18n.category_label(lang, cat_key if cat_key in CATEGORIES else "other")
+        if labels and cat_key in labels:
+            label = labels[cat_key]
+        else:
+            label = i18n.category_label(lang, cat_key if cat_key in CATEGORIES else "other")
         desc = i18n.t(lang, "ics.category", cat=label)
         if doc["note"]:
             desc += f"\n{doc['note']}"
@@ -603,6 +857,12 @@ def build_ics(docs, today: Optional[dt.date] = None, now: Optional[dt.datetime] 
             "CATEGORIES:" + _ics_escape(label),
             "TRANSP:TRANSPARENT",
         ]
+        try:
+            rule = _rrule(int(doc["recur_months"] or 0))
+        except (KeyError, IndexError, TypeError, ValueError):
+            rule = None
+        if rule:
+            lines.append(rule)
         for n in Store.thresholds(doc["remind_days"]):
             text = i18n.t(lang, "ics.alarm", title=doc["title"], when=i18n.days_phrase(lang, n),
                           date=i18n.fmt_date(start, lang))

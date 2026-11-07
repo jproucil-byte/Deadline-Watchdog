@@ -9,11 +9,13 @@ from __future__ import annotations
 import datetime as dt
 import hmac
 import html
+import http.client
 import json
 import os
 import re
 import secrets
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -28,13 +30,15 @@ from typing import Optional
 
 import docparse
 import i18n
+import scheduler
 import store as S
-from docparse import CATEGORIES
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 ACCEPT = ",".join(sorted(S.ALLOWED_EXT))
-FLASH = {"saved", "created", "deleted", "renewed", "uploaded", "filedeleted", "settings"}
+FLASH = {"saved", "created", "deleted", "renewed", "uploaded", "filedeleted", "settings", "archived",
+         "unarchived", "cat_added", "cat_deleted", "ab_saved", "ab_done", "sched_on", "sched_off", "test_sent"}
+RECUR_CHOICES = (0, 1, 3, 6, 12, 24, 36, 48, 60, 120)          # months
 SYMBOL = {"expired": "✕", "soon": "!", "ok": "✓", "none": "–"}
 NAV = [("/", "nav.overview"), ("/new", "nav.add"), ("/export", "nav.export"), ("/settings", "nav.settings")]
 
@@ -126,6 +130,14 @@ code,kbd{font:.9em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;backgrou
 pre.cmd{background:var(--gray-bg);padding:12px;border-radius:8px;overflow:auto;font:.88rem ui-monospace,Menlo,Consolas,monospace;margin:8px 0 12px}
 .foot{color:var(--muted);font-size:.85rem;padding:8px 0 32px}
 .cap li{margin-bottom:4px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+.chip{display:inline-block;padding:3px 10px;border-radius:999px;background:var(--gray-bg);color:var(--ink);
+text-decoration:none;font-size:.85rem;border:1px solid transparent}
+a.chip:hover{border-color:var(--accent)}.chip[aria-current=true]{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.chip .c{color:var(--muted);margin-left:4px}
+.more{margin:14px 0 0}
+table.list{width:100%;border-collapse:collapse}table.list td{padding:8px 0;border-top:1px solid var(--line);vertical-align:middle}
+table.list tr:first-child td{border-top:0}table.list td.r{text-align:right}
 @media(max-width:700px){.tiles{gap:8px}.tile{padding:10px 12px}.search,.grid2,.layout{grid-template-columns:1fr}
 a.doc{grid-template-columns:1fr auto}a.doc .badge{grid-column:1;grid-row:2;justify-self:start}
 .doc-when{grid-column:2;grid-row:1/3}header.top{position:static}header.top .wrap{gap:0;min-height:0;padding-top:4px;padding-bottom:2px}.brand{padding:6px 0}nav{width:100%;margin-left:0;gap:0;justify-content:space-between}nav a{padding:8px 10px;font-size:.95rem}}
@@ -204,7 +216,13 @@ def parse_multipart(content_type: str, body: bytes):
 class App:
     def __init__(self, store: S.Store, token: Optional[str] = None):
         self.store = store
-        self.token = token or secrets.token_urlsafe(24)
+        if not token:
+            # kept in the database, so forms in tabs left open still work after the app restarts
+            token = store.get_setting("csrf_token")
+            if not token or len(token) < 24:
+                token = secrets.token_urlsafe(24)
+                store.set_setting("csrf_token", token)
+        self.token = token
         self.allowed_hosts: set = set()
         self.max_upload = S.MAX_UPLOAD
         self.port = 0
@@ -254,6 +272,7 @@ def make_handler(app: App):
 
         def dispatch(self, method: str):
             self.nonce = secrets.token_urlsafe(12)
+            self._labels = None
             try:
                 self.lang = app.store.get_lang()
             except Exception:  # noqa: BLE001 - a broken settings read must not take the page down
@@ -296,6 +315,7 @@ def make_handler(app: App):
                 ("POST", R(r"/doc/(\d+)/renew"), self.post_renew),
                 ("POST", R(r"/doc/(\d+)/attach"), self.post_attach),
                 ("POST", R(r"/doc/(\d+)/delete"), self.post_delete),
+                ("POST", R(r"/doc/(\d+)/archive"), self.post_archive),
                 ("GET", R(r"/doc/(\d+)\.ics"), self.get_doc_ics),
                 ("POST", R(r"/file/(\d+)/delete"), self.post_file_delete),
                 ("GET", R(r"/file/(\d+)"), self.get_file),
@@ -304,6 +324,12 @@ def make_handler(app: App):
                 ("GET", R(r"/backup\.zip"), self.get_backup),
                 ("GET", R(r"/settings"), self.get_settings),
                 ("POST", R(r"/settings"), self.post_settings),
+                ("POST", R(r"/settings/category"), self.post_category_add),
+                ("POST", R(r"/settings/category/(u_[0-9a-f]{8})/delete"), self.post_category_delete),
+                ("POST", R(r"/settings/backup"), self.post_backup_settings),
+                ("POST", R(r"/settings/backup/run"), self.post_backup_run),
+                ("POST", R(r"/schedule"), self.post_schedule),
+                ("GET", R(r"/ping"), self.get_ping),
             ]
 
         def check_origin(self):
@@ -347,7 +373,7 @@ def make_handler(app: App):
                 body = self.read_body(1_000_000)
                 parsed = urllib.parse.parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
                 fields, files = {k: v[0] for k, v in parsed.items()}, {}
-            if not hmac.compare_digest(fields.get("csrf", ""), app.token):
+            if not hmac.compare_digest(fields.get("csrf", "").encode("utf-8"), app.token.encode("utf-8")):
                 raise HttpError(403, "http.stale")
             return fields, files
 
@@ -401,9 +427,32 @@ def make_handler(app: App):
             key = query.get("msg", "")
             return f'<div class="alert ok" role="status">{self.E("flash." + key)}</div>' if key in FLASH else ""
 
+        def labels(self) -> dict:
+            if getattr(self, "_labels", None) is None:
+                self._labels = app.store.category_labels(self.lang)
+            return self._labels
+
+        def cat_label(self, key: str) -> str:
+            labels = self.labels()
+            return labels.get(key) or labels["other"]
+
         def cat_options(self, selected: str) -> str:
             return "".join(f'<option value="{esc(k)}"{" selected" if k == selected else ""}>'
-                           f'{esc(i18n.category_label(self.lang, k))}</option>' for k in CATEGORIES)
+                           f'{esc(label)}</option>' for k, label in self.labels().items())
+
+        def recur_label(self, months: int) -> str:
+            if not months:
+                return self.T("recur.none")
+            if months % 12 == 0:
+                return self.TN("recur.years", months // 12)
+            return self.TN("recur.months", months)
+
+        def tag_chips(self, tags: str, current: str = "") -> str:
+            out = []
+            for t in [t for t in (tags or "").split(",") if t]:
+                cur = ' aria-current="true"' if t.casefold() == current.casefold() else ""
+                out.append(f'<a class="chip" href="/?t={esc(urllib.parse.quote(t))}"{cur}>#{esc(t)}</a>')
+            return "".join(out)
 
         def badge(self, st: dict) -> str:
             return f'<span class="badge {st["key"]}">{SYMBOL[st["key"]]} {esc(i18n.status_label(self.lang, st))}</span>'
@@ -412,13 +461,15 @@ def make_handler(app: App):
         def get_index(self, query):
             today = dt.date.today()
             q, cat, flt = query.get("q", "").strip(), query.get("c", ""), query.get("s", "")
+            tag, archive = query.get("t", "").strip(), query.get("a") == "1"
             if flt not in ("expired", "soon", "ok", "none"):
                 flt = ""
             keys = [S.classify(r["expires"], S.parse_remind_days(r["remind_days"]), today)["key"]
                     for r in app.store.list_documents()]
             counts = {k: keys.count(k) for k in ("expired", "soon", "ok", "none")}
+            n_archived = app.store.count_archived()
             rows = []
-            for r in app.store.list_documents(q, cat):
+            for r in app.store.list_documents(q, cat, tag, archived=archive):
                 st = S.classify(r["expires"], S.parse_remind_days(r["remind_days"]), today)
                 if flt and st["key"] != flt:
                     continue
@@ -432,6 +483,19 @@ def make_handler(app: App):
 
             tiles = '<div class="tiles">' + tile("expired") + tile("soon") + tile("ok") + "</div>"
             hidden_flt = f'<input type="hidden" name="s" value="{esc(flt)}">' if flt else ""
+            if tag:
+                hidden_flt += f'<input type="hidden" name="t" value="{esc(tag)}">'
+            if archive:
+                hidden_flt += '<input type="hidden" name="a" value="1">'
+            tags = app.store.all_tags()
+            chips = ""
+            if tags and not archive:
+                chips = '<div class="chips" aria-label="' + self.E("ov.tags_label") + '">' + "".join(
+                    f'<a class="chip" href="{"/" if t.casefold() == tag.casefold() else "/?t=" + esc(urllib.parse.quote(t))}"'
+                    f'{" aria-current=true" if t.casefold() == tag.casefold() else ""}>#{esc(t)}<span class="c">{n}</span></a>'
+                    for t, n in tags) + "</div>"
+            if tag and not any(t.casefold() == tag.casefold() for t, _ in tags):
+                chips += (f'<div class="chips"><a class="chip" href="/" aria-current="true">#{esc(tag)} ✕</a></div>')
             search = (f'<form class="search" method="get" action="/" role="search">'
                       f'<input type="search" name="q" value="{esc(q)}" placeholder="{self.E("ov.search_ph")}" '
                       f'aria-label="{self.E("ov.search_label")}">'
@@ -439,7 +503,9 @@ def make_handler(app: App):
                       f'<option value="">{self.E("ov.all_categories")}</option>{self.cat_options(cat)}</select>'
                       f'{hidden_flt}<button class="btn secondary" type="submit">{self.E("ov.search_btn")}</button></form>')
             if not rows:
-                if not any(counts.values()):
+                if archive:
+                    inner = f'<div class="card"><p>{self.E("ov.archive_empty")}</p></div>'
+                elif not any(counts.values()) and not n_archived:
                     inner = (f'<div class="card"><h2>{self.E("ov.empty_title")}</h2><p>{self.E("ov.empty_text")}</p>'
                              f'<a class="btn" href="/new">{self.E("ov.empty_btn")}</a></div>')
                 else:
@@ -447,9 +513,13 @@ def make_handler(app: App):
             else:
                 items = []
                 for r, st in rows:
-                    meta = i18n.category_label(self.lang, r["category"] if r["category"] in CATEGORIES else "other")
+                    meta = self.cat_label(r["category"])
+                    if r["recur_months"]:
+                        meta += " · ↻ " + self.recur_label(r["recur_months"])
                     if r["n_files"]:
                         meta += " · " + self.TN("files.count", r["n_files"])
+                    if r["tags"]:
+                        meta += " · " + " ".join("#" + t for t in r["tags"].split(",") if t)
                     if r["expires"]:
                         when = (f'<span class="date">{self.D(r["expires"])}</span>'
                                 f'<span class="rel">{esc(i18n.days_phrase(self.lang, st["days"]))}</span>')
@@ -459,10 +529,17 @@ def make_handler(app: App):
                                  f'<span class="doc-title">{esc(r["title"])}</span><span class="doc-meta">{esc(meta)}</span></span>'
                                  f'<span class="doc-when">{when}</span>{self.badge(st)}</a>')
                 inner = '<div class="docs">' + "".join(items) + "</div>"
+            if archive:
+                head = (f'<p><a href="/">{self.E("ov.archive_back")}</a></p>'
+                        f'<h1>{self.E("ov.archive_title")}</h1><p class="muted">{self.E("arch.help")}</p>')
+                self.page(self.T("ov.archive_title"), self.flash(query) + head + search + inner, "/")
+                return
             head = (f'<div class="actions" style="justify-content:space-between;margin-bottom:12px">'
                     f'<h1 style="margin:0">{self.E("ov.title")}</h1>'
                     f'<a class="btn" href="/new">{self.E("ov.add")}</a></div>')
-            self.page(self.T("ov.title"), self.flash(query) + head + tiles + search + inner, "/")
+            more = (f'<p class="more"><a href="/?a=1">{esc(self.TN("ov.archive_link", n_archived))}</a></p>'
+                    if n_archived else "")
+            self.page(self.T("ov.title"), self.flash(query) + head + tiles + search + chips + inner + more, "/")
 
         # ---- add a document ----------------------------------------------------
         def get_new(self, query):
@@ -500,7 +577,8 @@ def make_handler(app: App):
             result = docparse.analyze(str(path), name, lang=self.lang, date_order=app.store.get_date_order())
             app.store.set_temp_text(token, result["text"])
             values = {"title": result["title"], "category": result["category"], "expires": result["expires"] or "",
-                      "remind_days": result["remind_days"], "note": "", "tmp": token}
+                      "remind_days": result["remind_days"], "note": "", "tmp": token, "tags": "",
+                      "recur": str(DEFAULT_RECUR.get(result["category"], 0))}
             self.render_review(values, [], result, name)
 
         def simple_error(self, title_key, message, back, status):
@@ -509,10 +587,17 @@ def make_handler(app: App):
 
         def get_review(self, query):
             self.render_review({"title": "", "category": "other", "expires": "", "remind_days": "30,14,7,1",
-                                "note": "", "tmp": ""}, [], None, "")
+                                "note": "", "tmp": "", "tags": "", "recur": "0"}, [], None, "")
 
         def form_fields(self, v: dict) -> str:
-            defaults = json.dumps({k: m["remind"] for k, m in CATEGORIES.items()})
+            defaults = json.dumps({k: m["remind"] for k, m in app.store.categories().items()})
+            try:
+                cur_recur = int(str(v.get("recur") or 0))
+            except ValueError:
+                cur_recur = 0
+            choices = list(RECUR_CHOICES) + ([cur_recur] if cur_recur not in RECUR_CHOICES else [])
+            recur_opts = "".join(f'<option value="{m}"{" selected" if m == cur_recur else ""}>'
+                                 f'{esc(self.recur_label(m))}</option>' for m in sorted(choices))
             return f"""<div class="field"><label for="title">{self.E("form.title")}</label>
 <input type="text" id="title" name="title" value="{esc(v['title'])}" maxlength="200" required></div>
 <div class="grid2"><div class="field"><label for="category">{self.E("form.category")}</label>
@@ -521,6 +606,10 @@ def make_handler(app: App):
 <input type="date" id="expires" name="expires" value="{esc(v['expires'])}"></div></div>
 <div class="field"><label for="remind_days">{self.E("form.remind")} <span class="hint">{self.E("form.remind_hint")}</span></label>
 <input type="text" id="remind_days" name="remind_days" value="{esc(v['remind_days'])}" inputmode="numeric"></div>
+<div class="grid2"><div class="field"><label for="recur">{self.E("form.recur")} <span class="hint">{self.E("form.recur_hint")}</span></label>
+<select id="recur" name="recur">{recur_opts}</select></div>
+<div class="field"><label for="tags">{self.E("form.tags")} <span class="hint">{self.E("form.tags_hint")}</span></label>
+<input type="text" id="tags" name="tags" value="{esc(v.get('tags', '').replace(',', ', '))}" maxlength="500"></div></div>
 <div class="field"><label for="note">{self.E("form.note")}</label><textarea id="note" name="note" maxlength="5000">{esc(v['note'])}</textarea></div>"""
 
         def render_review(self, values, errors, analysis, filename):
@@ -568,18 +657,20 @@ def make_handler(app: App):
 
         def post_save(self, query):
             fields, _ = self.read_form()
-            values = {k: fields.get(k, "") for k in ("title", "category", "expires", "remind_days", "note", "tmp")}
+            values = {k: fields.get(k, "") for k in ("title", "category", "expires", "remind_days", "note", "tmp",
+                                                     "tags", "recur")}
             tmp = values["tmp"]
             info = app.store.temp_info(tmp) if tmp else None
             if tmp and info is None:
                 return self.render_review(values, [self.T("err.upload_gone")], None, "")
             try:
-                S.validate_fields(values["title"], values["category"], values["expires"],
-                                  values["remind_days"], values["note"])
+                app.store.validate(values["title"], values["category"], values["expires"],
+                                   values["remind_days"], values["note"], values["tags"], values["recur"])
             except S.ValidationError as e:
                 return self.render_review(values, [self.err(e)], None, info[1] if info else "")
             doc_id = app.store.add_document(values["title"], values["category"], values["expires"],
-                                            values["remind_days"], values["note"], info[2] if info else "")
+                                            values["remind_days"], values["note"], info[2] if info else "",
+                                            values["tags"], values["recur"])
             if info:
                 app.store.temp_to_attachment(tmp, doc_id)
             self.redirect(f"/doc/{doc_id}?msg=created")
@@ -596,17 +687,25 @@ def make_handler(app: App):
             today = dt.date.today()
             st = S.classify(doc["expires"], S.parse_remind_days(doc["remind_days"]), today)
             v = values or {"title": doc["title"], "category": doc["category"], "expires": doc["expires"] or "",
-                           "remind_days": doc["remind_days"], "note": doc["note"]}
+                           "remind_days": doc["remind_days"], "note": doc["note"], "tags": doc["tags"],
+                           "recur": str(doc["recur_months"])}
             if doc["expires"]:
                 when = f'{self.D(doc["expires"])} · {esc(i18n.days_phrase(self.lang, st["days"]))}'
             else:
                 when = self.E("detail.no_end")
+            if doc["recur_months"]:
+                when += " · ↻ " + esc(self.recur_label(doc["recur_months"]))
+            archived = bool(doc["archived"])
             err = ""
             if errors:
                 err = ('<div class="alert err" role="alert"><ul style="margin:0;padding-left:20px">'
                        + "".join(f"<li>{esc(e)}</li>" for e in errors) + "</ul></div>")
-            head = (f'<p><a href="/">{self.E("common.back")}</a></p><div class="actions" style="margin-bottom:6px">{self.badge(st)}</div>'
-                    f'<h1 style="margin-bottom:4px">{esc(doc["title"])}</h1><p class="muted">{when}</p>')
+            back = "/?a=1" if archived else "/"
+            chips = self.tag_chips(doc["tags"])
+            head = (f'<p><a href="{back}">{self.E("common.back")}</a></p><div class="actions" style="margin-bottom:6px">{self.badge(st)}</div>'
+                    f'<h1 style="margin-bottom:4px">{esc(doc["title"])}</h1><p class="muted">{when}</p>'
+                    + (f'<div class="chips">{chips}</div>' if chips else "")
+                    + (f'<div class="alert info">{self.E("arch.banner")}</div>' if archived else ""))
             edit = (f'<form class="card" method="post" action="/doc/{doc_id}/edit">{self.csrf()}<h2>{self.E("detail.data")}</h2>'
                     f'{self.form_fields(v)}<div class="actions"><button class="btn" type="submit">{self.E("form.save_changes")}</button>'
                     f'<a class="btn secondary" href="/doc/{doc_id}.ics">{self.E("detail.ics")}</a></div></form>')
@@ -614,8 +713,12 @@ def make_handler(app: App):
                 edit += (f'<details class="card"><summary>{self.E("detail.text")}</summary>'
                          f'<pre class="text">{esc(doc["body"][:6000])}</pre></details>')
 
+            recur_btn = (f'<button class="btn small" name="mode" value="recur">'
+                         f'{self.E("renew.recur", every=self.recur_label(doc["recur_months"]))}</button>'
+                         if doc["recur_months"] else "")
             renew = (f'<form class="card" method="post" action="/doc/{doc_id}/renew">{self.csrf()}<h2>{self.E("renew.title")}</h2>'
                      f'<p class="muted small">{self.E("renew.help")}</p><div class="actions" style="margin-bottom:12px">'
+                     f'{recur_btn}'
                      f'<button class="btn small secondary" name="mode" value="y1">{self.E("renew.y1")}</button>'
                      f'<button class="btn small secondary" name="mode" value="y2">{self.E("renew.y2")}</button></div>'
                      f'<div class="field"><label for="rdate">{self.E("renew.exact")}</label>'
@@ -642,20 +745,28 @@ def make_handler(app: App):
                      f'<div class="field"><label for="afile">{self.E("files.add")}</label>'
                      f'<input type="file" id="afile" name="file" required accept="{esc(ACCEPT)}"></div>'
                      f'<button class="btn small secondary" type="submit">{self.E("files.upload")}</button></form></div>')
+            arch = (f'<form class="card" method="post" action="/doc/{doc_id}/archive">{self.csrf()}'
+                    f'<h2>{self.E("arch.title")}</h2><p class="muted small">{self.E("arch.help")}</p>'
+                    f'<input type="hidden" name="archived" value="{"0" if archived else "1"}">'
+                    f'<button class="btn small secondary" type="submit">'
+                    f'{self.E("arch.restore_btn" if archived else "arch.btn")}</button></form>')
             danger = (f'<form class="card" method="post" action="/doc/{doc_id}/delete" '
                       f'data-confirm="{self.E("del.confirm")}">{self.csrf()}'
                       f'<h2>{self.E("del.title")}</h2><p class="muted small">{self.E("del.help")}</p>'
                       f'<button class="btn danger" type="submit">{self.E("del.btn")}</button></form>')
-            body = self.flash(query) + head + err + f'<div class="layout"><div>{edit}</div><div>{renew}{files}{danger}</div></div>'
+            body = self.flash(query) + head + err + f'<div class="layout"><div>{edit}</div><div>{renew}{files}{arch}{danger}</div></div>'
             self.page(doc["title"], body, "/", 400 if errors else 200)
 
         def post_edit(self, query, doc_id):
             fields, _ = self.read_form()
             self.need_doc(doc_id)
-            values = {k: fields.get(k, "") for k in ("title", "category", "expires", "remind_days", "note")}
+            values = {k: fields.get(k, "") for k in ("title", "category", "expires", "remind_days", "note",
+                                                     "tags", "recur")}
             try:
                 app.store.update_document(doc_id, values["title"], values["category"], values["expires"],
-                                          values["remind_days"], values["note"])
+                                          values["remind_days"], values["note"],
+                                          values["tags"] if "tags" in fields else None,
+                                          values["recur"] if "recur" in fields else None)
             except S.ValidationError as e:
                 return self.get_doc({}, doc_id, values, [self.err(e)])
             self.redirect(f"/doc/{doc_id}?msg=saved")
@@ -674,6 +785,8 @@ def make_handler(app: App):
                     app.store.set_expiry(doc_id, new.isoformat())
                 elif mode == "date":
                     app.store.set_expiry(doc_id, fields.get("date", ""))
+                elif mode == "recur":
+                    app.store.renew_by_interval(doc_id, today)
                 else:
                     raise HttpError(400, "http.bad_action")
             except S.ValidationError as e:
@@ -691,6 +804,13 @@ def make_handler(app: App):
             except S.ValidationError as e:
                 return self.get_doc({}, doc_id, None, [self.err(e)])
             self.redirect(f"/doc/{doc_id}?msg=uploaded")
+
+        def post_archive(self, query, doc_id):
+            fields, _ = self.read_form()
+            self.need_doc(doc_id)
+            on = fields.get("archived") == "1"
+            app.store.set_archived(doc_id, on)
+            self.redirect(f"/doc/{doc_id}?msg={'archived' if on else 'unarchived'}")
 
         def post_delete(self, query, doc_id):
             self.read_form()
@@ -733,7 +853,7 @@ def make_handler(app: App):
                 shutil.copyfileobj(fh, self.wfile)
 
         def send_ics(self, docs, filename):
-            data = S.build_ics(docs, lang=self.lang).encode("utf-8")
+            data = S.build_ics(docs, lang=self.lang, labels=self.labels()).encode("utf-8")
             self.send_bytes(200, data, "text/calendar; charset=utf-8",
                             {"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -765,22 +885,66 @@ def make_handler(app: App):
                     pass
 
         def get_export(self, query):
-            body = f"""<h1>{self.E("export.title")}</h1>
+            body = f"""{self.flash(query)}<h1>{self.E("export.title")}</h1>
 <div class="card"><h2>{self.E("export.cal_title")}</h2>
 <p>{self.E("export.cal_text")}</p>
 <p class="muted small">{self.E("export.cal_note")}</p>
 <a class="btn" href="/calendar.ics">{self.E("export.cal_btn")}</a></div>
-<div class="card"><h2>{self.E("export.desk_title")}</h2>
-<p>{self.E("export.desk_text")}</p>
-<pre class="cmd">python watchdog.py notify</pre></div>
+{self.schedule_card()}
 <div class="card"><h2>{self.E("export.bk_title")}</h2>
 <p>{self.E("export.bk_text")}</p>
-<pre class="cmd">python watchdog.py restore backup.zip --yes</pre>
+<pre class="cmd">{esc(scheduler.cli_prefix(app.store.dir))} restore backup.zip --yes</pre>
 <a class="btn secondary" href="/backup.zip">{self.E("export.bk_btn")}</a></div>"""
             self.page(self.T("export.title"), body, "/export")
 
+        def schedule_card(self) -> str:
+            parts = [f'<div class="card"><h2>{self.E("export.desk_title")}</h2><p>{self.E("export.desk_text")}</p>']
+            kind = scheduler.kind()
+            if kind:
+                on = scheduler.status(app.store.dir)
+                if on:
+                    parts.append(f'<div class="alert ok">✓ {self.E("sched.on")} {self.E("sched.how." + kind)}</div>')
+                else:
+                    parts.append(f'<p class="muted">{self.E("sched.off")} {self.E("sched.how." + kind)}</p>')
+                action = "off" if on else "on"
+                parts.append(f'<form method="post" action="/schedule" class="actions">{self.csrf()}'
+                             f'<button class="btn{" secondary" if on else ""}" name="action" value="{action}">'
+                             f'{self.E("sched.disable" if on else "sched.enable")}</button>'
+                             f'<button class="btn secondary" name="action" value="test">{self.E("sched.test")}</button>'
+                             f'</form>')
+            else:
+                parts.append(f'<p class="muted">{self.E("sched.unsupported")}</p>')
+            parts.append(f'<details style="margin-top:12px"><summary>{self.E("sched.manual")}</summary>'
+                         f'<pre class="cmd">{esc(scheduler.command_line(app.store.dir))}</pre></details></div>')
+            return "".join(parts)
+
+        def post_schedule(self, query):
+            fields, _ = self.read_form()
+            action = fields.get("action", "")
+            try:
+                if action == "on":
+                    scheduler.install(app.store.dir)
+                    msg = "sched_on"
+                elif action == "off":
+                    scheduler.remove()
+                    msg = "sched_off"
+                elif action == "test":
+                    if not scheduler.desktop_notify(i18n.APP_NAME, self.T("cli.test_text")):
+                        raise scheduler.ScheduleError(self.T("cli.test_fail"))
+                    msg = "test_sent"
+                else:
+                    raise HttpError(400, "http.bad_action")
+            except scheduler.ScheduleError as e:
+                return self.simple_error("export.title", self.T("err.sched_failed", msg=str(e)), "/export", 500)
+            self.redirect(f"/export?msg={msg}")
+
+        def get_ping(self, query):
+            """Lets a second start of the program find this one (and its data folder) instead of starting twice."""
+            body = json.dumps({"app": i18n.APP_NAME, "data": str(app.store.dir)}).encode("utf-8")
+            self.send_bytes(200, body, "application/json")
+
         # ---- settings ----------------------------------------------------------------------
-        def get_settings(self, query):
+        def get_settings(self, query, errors=None, ab_values=None, cat_values=None):
             order = app.store.get_date_order()
             langs = "".join(f'<option value="{esc(code)}"{" selected" if code == self.lang else ""}>{esc(name)}</option>'
                             for code, name in i18n.LANGS.items())
@@ -794,7 +958,93 @@ def make_handler(app: App):
                     f'<fieldset><legend>{self.E("set.date_order")}</legend>{radios}'
                     f'<p class="muted small">{self.E("set.date_help")}</p></fieldset>'
                     f'<button class="btn" type="submit">{self.E("set.save")}</button></form>')
-            self.page(self.T("set.title"), body, "/settings")
+            err = ""
+            if errors:
+                err = ('<div class="alert err" role="alert"><ul style="margin:0;padding-left:20px">'
+                       + "".join(f"<li>{esc(e)}</li>" for e in errors) + "</ul></div>")
+            body = err + body + self.categories_card(cat_values or {}) + self.backup_card(ab_values)
+            self.page(self.T("set.title"), body, "/settings", 400 if errors else 200)
+
+        def categories_card(self, v: dict) -> str:
+            rows = []
+            for c in app.store.custom_categories():
+                used = esc(self.TN("set.cat_used", c["n_docs"])) if c["n_docs"] else ""
+                rows.append(f'<tr><td><strong>{esc(c["label"])}</strong><br><span class="muted small">'
+                            f'{self.E("form.remind")}: {esc(c["remind"].replace(",", ", "))}'
+                            f'{" · " + used if used else ""}</span></td>'
+                            f'<td class="r"><form method="post" action="/settings/category/{esc(c["id"])}/delete" '
+                            f'data-confirm="{self.E("set.cat_confirm")}">{self.csrf()}'
+                            f'<button class="btn small danger" type="submit">{self.E("set.cat_delete")}</button>'
+                            f'</form></td></tr>')
+            listing = (f'<table class="list">{"".join(rows)}</table>' if rows
+                       else f'<p class="muted">{self.E("set.cat_none")}</p>')
+            return (f'<div class="card"><h2>{self.E("set.cat_title")}</h2><p class="muted small">{self.E("set.cat_help")}</p>'
+                    f'{listing}<form method="post" action="/settings/category" style="margin-top:14px">{self.csrf()}'
+                    f'<div class="grid2"><div class="field"><label for="cat_label">{self.E("set.cat_label")}</label>'
+                    f'<input type="text" id="cat_label" name="label" maxlength="60" required value="{esc(v.get("label", ""))}"></div>'
+                    f'<div class="field"><label for="cat_remind">{self.E("set.cat_remind")}</label>'
+                    f'<input type="text" id="cat_remind" name="remind" inputmode="numeric" '
+                    f'value="{esc(v.get("remind", "30,14,7,1"))}"></div></div>'
+                    f'<button class="btn secondary" type="submit">{self.E("set.cat_add")}</button></form></div>')
+
+        def backup_card(self, v=None) -> str:
+            cfg = app.store.auto_backup_config()
+            v = v or {"dir": cfg["dir"], "days": str(cfg["days"]), "keep": str(cfg["keep"])}
+            if not cfg["dir"]:
+                state = f'<p class="muted">{self.E("set.ab_off")}</p>'
+            elif cfg["last"]:
+                state = f'<p class="muted">{self.E("set.ab_last", when=cfg["last"][:16])}</p>'
+            else:
+                state = f'<p class="muted">{self.E("set.ab_never")}</p>'
+            if cfg["error"]:
+                state += f'<div class="alert err">{self.E("set.ab_error", msg=cfg["error"])}</div>'
+            hint = scheduler.suggested_backup_dir()
+            tip = f'<br>{self.E("set.ab_suggest", path=hint)}' if hint else ""
+            run = (f'<form method="post" action="/settings/backup/run" style="margin-top:10px">{self.csrf()}'
+                   f'<button class="btn secondary" type="submit">{self.E("set.ab_now")}</button></form>'
+                   if cfg["dir"] else "")
+            return (f'<div class="card"><h2>{self.E("set.ab_title")}</h2><p class="muted small">{self.E("set.ab_help")}{tip}</p>'
+                    f'{state}<form method="post" action="/settings/backup">{self.csrf()}'
+                    f'<div class="field"><label for="ab_dir">{self.E("set.ab_dir")} <span class="hint">{self.E("set.ab_dir_hint")}</span></label>'
+                    f'<input type="text" id="ab_dir" name="dir" value="{esc(v["dir"])}" placeholder="{esc(hint)}"></div>'
+                    f'<div class="grid2"><div class="field"><label for="ab_days">{self.E("set.ab_days")}</label>'
+                    f'<input type="text" id="ab_days" name="days" inputmode="numeric" value="{esc(v["days"])}"></div>'
+                    f'<div class="field"><label for="ab_keep">{self.E("set.ab_keep")}</label>'
+                    f'<input type="text" id="ab_keep" name="keep" inputmode="numeric" value="{esc(v["keep"])}"></div></div>'
+                    f'<button class="btn" type="submit">{self.E("set.ab_save")}</button></form>{run}</div>')
+
+        def post_category_add(self, query):
+            fields, _ = self.read_form()
+            try:
+                app.store.add_category(fields.get("label", ""), fields.get("remind", ""))
+            except S.ValidationError as e:
+                return self.get_settings({}, [self.err(e)], cat_values=fields)
+            self.redirect("/settings?msg=cat_added")
+
+        def post_category_delete(self, query, cat_id):
+            self.read_form()
+            try:
+                app.store.delete_category(cat_id)
+            except KeyError:
+                raise HttpError(404, "http.not_found")
+            self.redirect("/settings?msg=cat_deleted")
+
+        def post_backup_settings(self, query):
+            fields, _ = self.read_form()
+            v = {k: fields.get(k, "") for k in ("dir", "days", "keep")}
+            try:
+                app.store.set_auto_backup(v["dir"], v["days"], v["keep"])
+            except S.ValidationError as e:
+                return self.get_settings({}, [self.err(e)], ab_values=v)
+            self.redirect("/settings?msg=ab_saved")
+
+        def post_backup_run(self, query):
+            self.read_form()
+            try:
+                done = app.store.run_auto_backup(force=True)
+            except OSError as e:
+                return self.get_settings({}, [self.T("err.ab_failed", msg=str(e))])
+            self.redirect("/settings?msg=" + ("ab_done" if done else "ab_saved"))
 
         def post_settings(self, query):
             fields, _ = self.read_form()
@@ -810,13 +1060,46 @@ def make_handler(app: App):
 # --------------------------------------------------------------------------
 # Starting the server
 # --------------------------------------------------------------------------
+DEFAULT_RECUR = {"vehicle": 24, "inspection": 12, "insurance": 12}   # suggested repeat (months) per category
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # On Windows SO_REUSEADDR lets a second program take a port that is already in use (both then "work"),
+    # so there the port is claimed exclusively instead.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+class AlreadyRunning(Exception):
+    def __init__(self, port: int):
+        super().__init__(port)
+        self.port = port
+
+
+def running_copy(port: int, data_dir) -> bool:
+    """True when the program listening on `port` is this app working with the same data folder."""
+    conn = http.client.HTTPConnection(HOST, port, timeout=2)
+    try:
+        conn.request("GET", "/ping", headers={"Host": f"{HOST}:{port}"})
+        r = conn.getresponse()
+        if r.status != 200:
+            return False
+        info = json.loads(r.read(4096).decode("utf-8"))
+        return info.get("app") == i18n.APP_NAME and os.path.normcase(info.get("data", "")) == \
+            os.path.normcase(str(data_dir))
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    finally:
+        conn.close()
 
 
 def make_server(store: S.Store, port: int = DEFAULT_PORT, search: bool = True,
-                token: Optional[str] = None):
+                token: Optional[str] = None, reuse_running: bool = False):
     app = App(store, token)
     last = None
     for p in (range(port, port + 20) if search and port else [port]):
@@ -826,13 +1109,38 @@ def make_server(store: S.Store, port: int = DEFAULT_PORT, search: bool = True,
             return httpd, app
         except OSError as e:
             last = e
+            if reuse_running and p and running_copy(p, store.dir):
+                raise AlreadyRunning(p)
     raise OSError(f"Could not open port {port}: {last}")
+
+
+def _auto_backup_loop(store: S.Store, stop: threading.Event) -> None:
+    if stop.wait(5):
+        return
+    while True:
+        try:
+            done = store.run_auto_backup()
+            if done:
+                print(i18n.t(store.get_lang(), "cli.ab_done", path=done))
+        except Exception as e:  # noqa: BLE001 - the error is shown on the Settings page; keep the app running
+            print(i18n.t(i18n.DEFAULT_LANG, "cli.error", msg=e), file=sys.stderr)
+        if stop.wait(3600):
+            return
 
 
 def serve(store: S.Store, port: int = DEFAULT_PORT, open_browser: bool = True) -> None:
     lang = store.get_lang()
-    httpd, app = make_server(store, port, search=port == DEFAULT_PORT)
+    try:
+        httpd, app = make_server(store, port, search=port == DEFAULT_PORT, reuse_running=True)
+    except AlreadyRunning as e:
+        url = f"http://127.0.0.1:{e.port}/"
+        print(i18n.t(lang, "srv.already", app=i18n.APP_NAME, url=url))
+        if open_browser:
+            webbrowser.open(url)
+        return
     url = f"http://127.0.0.1:{app.port}/"
+    stop = threading.Event()
+    threading.Thread(target=_auto_backup_loop, args=(store, stop), daemon=True).start()
     print(i18n.t(lang, "srv.running", app=i18n.APP_NAME, url=url))
     print(i18n.t(lang, "srv.data", path=store.dir))
     print(i18n.t(lang, "srv.stop"))
@@ -843,4 +1151,5 @@ def serve(store: S.Store, port: int = DEFAULT_PORT, open_browser: bool = True) -
     except KeyboardInterrupt:
         print("\n" + i18n.t(lang, "srv.bye"))
     finally:
+        stop.set()
         httpd.server_close()

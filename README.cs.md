@@ -34,6 +34,17 @@ cd Deadline-Watchdog
 Jazyk a pořadí číselných dat (03/04/2027 = 4. března, nebo 3. dubna?) se nastavují v **Nastavení**.
 Datum se vždy zobrazuje jednoznačně (4. 3. 2027) a nejednoznačné zápisy ti program výslovně oznámí.
 
+## Co umí navíc (verze 1.2)
+
+- **Opakující se termíny:** u dokumentu nastav „Opakuje se“ (každý měsíc … každých 10 let) a tlačítko
+  *Prodloužit o další období* posune konec přesně o tuhle dobu. Kalendář pak ukazuje i další období.
+- **Štítky** (např. `auto, Jana`) seskupí dokumenty napříč kategoriemi; kliknutím na štítek v přehledu filtruješ.
+- **Vlastní kategorie** přidáš v **Nastavení → Vlastní kategorie**.
+- **Archiv:** věci, které už nepotřebuješ (prodané auto, zrušená smlouva), přesuneš do archivu. Zůstanou i se
+  soubory, ale nezobrazují se, neposílají upozornění a nejsou v exportu do kalendáře.
+- **Automatická záloha:** v **Nastavení → Automatická záloha** zvol složku (nejlépe v OneDrive/Dropboxu nebo na jiném
+  disku), jak často zálohovat a kolik záloh nechat. Starší automatické zálohy se mažou, jiné soubory ve složce ne.
+
 ## Data ze starších verzí
 
 Když spustíš tuhle verzi nad složkou `data/` z původního „Hlídače termínů“ nebo z Expiry Keeperu, databáze i kategorie se
@@ -49,8 +60,10 @@ a `pdftoppm`. Stránka **Přidat** ukazuje, co z toho na tvém počítači progr
 ## Upozornění
 
 1. Přehled v aplikaci. 2. Kalendář v telefonu: stránka **Export** → stáhni `.ics` (upozornění v 9:00 v předstihu,
-který nastavíš u dokumentu). 3. Oznámení na ploše: `python watchdog.py notify --quiet`, naplánované při přihlášení nebo
-jednou denně (Plánovač úloh ve Windows, cron v Linuxu a macOS).
+který nastavíš u dokumentu). 3. Oznámení na ploše: na stránce **Export** klikni na *Zapnout automatická upozornění*
+(nebo `python watchdog.py schedule`). Ve Windows se vytvoří úloha v Plánovači úloh (denně v 9:00 a po přihlášení,
+bez práv správce a bez blikajícího okna), v macOS LaunchAgent, v Linuxu položka automatického spuštění po přihlášení.
+Vypnutí: tlačítkem nebo `python watchdog.py schedule --remove`.
 
 ## Záloha
 
@@ -59,8 +72,8 @@ jednou denně (Plánovač úloh ve Windows, cron v Linuxu a macOS).
 
 ## Omezení
 
-Čtení fotek není neomylné, proto datum vždy kontroluj. Ověřeno je jen na Linuxu; spouštěče a oznámení pro Windows
-a macOS jsem nemohl vyzkoušet.
+Čtení fotek není neomylné, proto datum vždy kontroluj. Vyzkoušeno na Linuxu a Windows 11 (včetně naplánovaných
+upozornění); macOS je napsaný, ale nevyzkoušený.
 
 ## Autor
 

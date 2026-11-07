@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 import zipfile
@@ -21,6 +22,10 @@ import web  # noqa: E402
 
 PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
        b"\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa7\x9a\xa0\xa0\x00\x00\x00\x00IEND\xaeB`\x82")
+
+
+def r_plain(text):
+    return html.unescape(text)
 
 
 def iso(days):
@@ -234,7 +239,7 @@ class Pages(WebCase):
 
     def test_export_page(self):
         t = self.get("/export").text
-        self.assertIn("python watchdog.py notify", t)
+        self.assertRegex(r_plain(t), r"watchdog\.py\"? --data .+ notify")
         self.assertIn("restore backup.zip --yes", t)
         self.assertIn('href="/calendar.ics"', t)
         self.assertIn('href="/backup.zip"', t)
@@ -585,6 +590,10 @@ class FilesAndExports(WebCase):
             self.assertIn("watchdog.db", z.namelist())
             self.assertEqual(len([n for n in z.namelist() if n.startswith("files/")]), 1)
             self.assertIsNone(z.testzip())
+        # the server deletes its temporary zip right after sending it, which can be a moment after we read it
+        deadline = time.monotonic() + 5
+        while list(self.store.tmp.iterdir()) and time.monotonic() < deadline:
+            time.sleep(0.02)
         self.assertEqual(list(self.store.tmp.iterdir()), [])                 # no temporary leftovers
 
 

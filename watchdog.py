@@ -9,6 +9,7 @@ Without a command it starts the web interface (on this computer only). Other com
   backup    save a backup (database + files) to a zip file
   restore   restore data from a backup
   analyze   show what the program reads from one file (for trying things out)
+  schedule  run the reminder check automatically every day (--remove to stop, --status to see)
 """
 from __future__ import annotations
 
@@ -17,9 +18,6 @@ import contextlib
 import datetime as dt
 import json
 import os
-import platform
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -28,46 +26,18 @@ sys.path.insert(0, str(HERE))
 
 import docparse  # noqa: E402
 import i18n  # noqa: E402
+import scheduler  # noqa: E402
 import store as S  # noqa: E402
 import web  # noqa: E402
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 
 def say(text: str = "") -> None:
     print(text)
 
 
-# --------------------------------------------------------------------------
-# Desktop notifications
-# --------------------------------------------------------------------------
-def desktop_notify(title: str, text: str) -> bool:
-    """Shows a desktop notification. Returns False when this system can't."""
-    system = platform.system()
-    try:
-        if system == "Darwin" and shutil.which("osascript"):
-            subprocess.run(["osascript", "-e", "on run argv",
-                            "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
-                            "-e", "end run", text, title],
-                           check=True, timeout=15, capture_output=True)
-            return True
-        if system == "Windows" and shutil.which("powershell"):
-            script = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing;"
-                      "$n=New-Object System.Windows.Forms.NotifyIcon;"
-                      "$n.Icon=[System.Drawing.SystemIcons]::Information;$n.Visible=$true;"
-                      "$n.ShowBalloonTip(15000,$env:WATCHDOG_TITLE,$env:WATCHDOG_TEXT,"
-                      "[System.Windows.Forms.ToolTipIcon]::Info);Start-Sleep -Seconds 16;$n.Dispose()")
-            env = dict(os.environ, WATCHDOG_TITLE=title, WATCHDOG_TEXT=text)
-            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
-                             env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            return True
-        if shutil.which("notify-send"):
-            subprocess.run(["notify-send", "--app-name=" + i18n.APP_NAME, "--", title, text],
-                           check=True, timeout=15, capture_output=True)
-            return True
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return False
+desktop_notify = scheduler.desktop_notify
 
 
 # --------------------------------------------------------------------------
@@ -113,6 +83,13 @@ def cmd_notify(store: S.Store, args) -> int:
         ok = desktop_notify(i18n.APP_NAME, i18n.t(lang, "cli.test_text"))
         say(i18n.t(lang, "cli.test_ok" if ok else "cli.test_fail"))
         return 0 if ok else 1
+    if not args.dry_run:
+        try:                                  # the scheduled check also takes care of the automatic backup
+            done = store.run_auto_backup()
+            if done and not args.quiet:
+                say(i18n.t(lang, "cli.ab_done", path=done))
+        except OSError as e:                  # remembered for the Settings page
+            say(i18n.t(lang, "cli.error", msg=e))
     items = store.due_notifications()
     if not items:
         if not args.quiet:
@@ -138,7 +115,8 @@ def cmd_notify(store: S.Store, args) -> int:
 def cmd_export(store: S.Store, args) -> int:
     lang = store.get_lang()
     out = Path(args.file or f"{i18n.APP_SLUG}.ics")
-    out.write_bytes(S.build_ics(store.list_documents(), lang=lang).encode("utf-8"))
+    out.write_bytes(S.build_ics(store.list_documents(), lang=lang,
+                                labels=store.category_labels(lang)).encode("utf-8"))
     say(i18n.t(lang, "cli.exported", path=out.resolve()))
     return 0
 
@@ -164,6 +142,30 @@ def cmd_restore(store: S.Store, args) -> int:
     old = store.restore_from(src)
     say(i18n.t(lang, "cli.restored"))
     say(f"  {old}")
+    return 0
+
+
+def cmd_schedule(store: S.Store, args) -> int:
+    lang = store.get_lang()
+    kind = scheduler.kind()
+    if kind is None:
+        say(i18n.t(lang, "sched.unsupported"))
+        return 1
+    try:
+        if args.status:
+            on = scheduler.status(store.dir)
+            say(i18n.t(lang, "sched.on" if on else "sched.off") + " " + i18n.t(lang, "sched.how." + kind))
+            return 0
+        if args.remove:
+            removed = scheduler.remove()
+            say(i18n.t(lang, "cli.sched_removed" if removed else "sched.off"))
+            return 0
+        scheduler.install(store.dir)
+    except scheduler.ScheduleError as e:
+        say(i18n.t(lang, "err.sched_failed", msg=e))
+        return 1
+    say(i18n.t(lang, "sched.on") + " " + i18n.t(lang, "sched.how." + kind))
+    say(i18n.t(lang, "cli.sched_test"))
     return 0
 
 
@@ -224,6 +226,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("file")
     r.add_argument("--yes", action="store_true", help="confirm that the current data may be replaced")
     r.set_defaults(func=cmd_restore)
+    sc = sub.add_parser("schedule", help="check deadlines automatically every day (desktop notifications)")
+    sc.add_argument("--remove", action="store_true", help="stop the automatic check")
+    sc.add_argument("--status", action="store_true", help="show whether the check is scheduled")
+    sc.set_defaults(func=cmd_schedule)
     a = sub.add_parser("analyze", help="show what the program reads from one file")
     a.add_argument("file")
     a.add_argument("--json", action="store_true")

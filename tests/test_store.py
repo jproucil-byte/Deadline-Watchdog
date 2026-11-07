@@ -90,7 +90,7 @@ class Validation(unittest.TestCase):
     def test_fields_are_cleaned_and_legacy_categories_mapped(self):
         f = S.validate_fields("  Policy ", "pojisteni", "2027-03-04", "7, 30", "  note ")
         self.assertEqual(f, {"title": "Policy", "category": "insurance", "expires": "2027-03-04",
-                             "remind_days": "30,7", "note": "note"})
+                             "remind_days": "30,7", "note": "note", "tags": "", "recur_months": 0})
         self.assertIsNone(S.validate_fields("x", "", "", "", "")["expires"])
         self.assertEqual(S.validate_fields("x", "", "", "", "")["category"], "other")
 
@@ -474,7 +474,7 @@ class BackupRestore(Base):
             "not a zip": (self.root / "n.zip", "err.restore_notzip"),
             "no database": (self.make_zip({"readme.txt": b"x"}), "err.restore_nodb"),
             "path traversal": (self.make_zip({"watchdog.db": db, "../evil.txt": b"x"}), "err.restore_unexpected"),
-            "unexpected name": (self.make_zip({"watchdog.db": db, "files/not-a-hash.pdf": b"x"}),
+            "nested folder": (self.make_zip({"watchdog.db": db, "files/sub/not-a-hash.pdf": b"x"}),
                                 "err.restore_unexpected"),
             "absolute path": (self.make_zip({"watchdog.db": db, "/etc/passwd": b"x"}), "err.restore_unexpected"),
             "corrupt db": (self.make_zip({"watchdog.db": b"this is not sqlite" * 100}), "err.restore_corrupt"),
