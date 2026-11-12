@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
+import functools
+import threading
 import json
 import mimetypes
 import os
@@ -224,6 +227,20 @@ NEW_COLUMNS = (("tags", "TEXT NOT NULL DEFAULT ''"),
 AUTO_BACKUP_RX = re.compile(r"^" + re.escape(i18n.APP_SLUG) + r"-auto-\d{4}-\d{2}-\d{2}-\d{6}\.zip$")
 
 
+# One reentrant lock per data directory, shared by threads and by app/CLI processes.
+_LOCKS = {}
+_LOCKS_GUARD = threading.Lock()
+_LOCK_STATE = threading.local()
+
+
+def locked(method):
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        with self.data_lock():
+            return method(self, *args, **kwargs)
+    return call
+
+
 class Store:
     def __init__(self, data_dir, lang: Optional[str] = None):
         self.dir = Path(data_dir).resolve()
@@ -235,16 +252,58 @@ class Store:
         with contextlib.suppress(OSError):
             os.chmod(self.dir, 0o700)
         self.db_path = self.dir / DB_NAME
-        if not self.db_path.exists():                              # data of an earlier version
-            for old_name in LEGACY_DB_NAMES:
-                legacy = self.dir / old_name
-                if legacy.exists():
-                    for suffix in ("", "-wal", "-shm"):
-                        with contextlib.suppress(OSError):
-                            os.replace(str(legacy) + suffix, str(self.db_path) + suffix)
-                    break
-        self._init_db()
-        self.cleanup_temp()
+        with self.data_lock():
+            if not self.db_path.exists():                              # data of an earlier version
+                for old_name in LEGACY_DB_NAMES:
+                    legacy = self.dir / old_name
+                    if legacy.exists():
+                        for suffix in ("", "-wal", "-shm"):
+                            with contextlib.suppress(OSError):
+                                os.replace(str(legacy) + suffix, str(self.db_path) + suffix)
+                        break
+            self._init_db()
+            self.cleanup_temp()
+
+    @contextlib.contextmanager
+    def data_lock(self):
+        key = os.path.normcase(str(self.dir))
+        with _LOCKS_GUARD:
+            lock = _LOCKS.setdefault(key, threading.RLock())
+        with lock:
+            held = getattr(_LOCK_STATE, "held", None)
+            if held is None:
+                held = _LOCK_STATE.held = set()
+            if key in held:
+                yield
+                return
+            with open(self.dir / ".watchdog.lock", "a+b") as fh:
+                if os.name == "nt":
+                    import msvcrt
+                    if fh.tell() == 0:
+                        fh.write(b"0")
+                        fh.flush()
+                    while True:
+                        fh.seek(0)
+                        try:
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError as exc:
+                            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                                raise
+                            time.sleep(0.05)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                held.add(key)
+                try:
+                    yield
+                finally:
+                    held.remove(key)
+                    if os.name == "nt":
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     def _init_db(self) -> None:
         with self.conn() as c:
@@ -259,17 +318,18 @@ class Store:
 
     @contextlib.contextmanager
     def conn(self):
-        c = sqlite3.connect(self.db_path, timeout=15)
-        c.row_factory = sqlite3.Row
-        c.execute("PRAGMA foreign_keys=ON")
-        try:
-            yield c
-            c.commit()
-        except BaseException:
-            c.rollback()
-            raise
-        finally:
-            c.close()
+        with self.data_lock():
+            c = sqlite3.connect(self.db_path, timeout=15)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys=ON")
+            try:
+                yield c
+                c.commit()
+            except BaseException:
+                c.rollback()
+                raise
+            finally:
+                c.close()
 
     # ---- settings -----------------------------------------------------------
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -313,19 +373,41 @@ class Store:
         return validate_fields(title, category, expires, remind_days, note, tags, recur,
                                categories=self.categories())
 
+    @locked
     def add_document(self, title, category="other", expires=None, remind_days="30,14,7,1",
-                     note="", body="", tags="", recur="") -> int:
+                     note="", body="", tags="", recur="", upload_token="") -> int:
         f = self.validate(title, category, expires, remind_days, note, tags, recur)
         body = (body or "")[:MAX_BODY]
         now = _now()
-        with self.conn() as c:
-            cur = c.execute(
-                "INSERT INTO documents(title,category,expires,remind_days,note,body,search,created,updated,"
-                "tags,recur_months) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (f["title"], f["category"], f["expires"], f["remind_days"], f["note"], body,
-                 self._search_blob(f["title"], f["note"], body, f["tags"]), now, now,
-                 f["tags"], f["recur_months"]))
-            return int(cur.lastrowid)
+        upload = self.temp_info(upload_token) if upload_token else None
+        if upload_token and upload is None:
+            raise ValidationError("err.upload_gone")
+        dest = None
+        try:
+            with self.conn() as c:
+                cur = c.execute(
+                    "INSERT INTO documents(title,category,expires,remind_days,note,body,search,created,updated,"
+                    "tags,recur_months) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (f["title"], f["category"], f["expires"], f["remind_days"], f["note"], body,
+                     self._search_blob(f["title"], f["note"], body, f["tags"]), now, now,
+                     f["tags"], f["recur_months"]))
+                doc_id = int(cur.lastrowid)
+                if upload:
+                    path, name, _ = upload
+                    stored = uuid.uuid4().hex + Path(name).suffix.lower()
+                    dest = self.files / stored
+                    shutil.copyfile(path, dest)
+                    c.execute("INSERT INTO attachments(doc_id,filename,stored,size,mime,added) VALUES(?,?,?,?,?,?)",
+                              (doc_id, name, stored, dest.stat().st_size,
+                               mimetypes.guess_type(name)[0] or "application/octet-stream", now))
+        except BaseException:
+            if dest is not None:
+                with contextlib.suppress(OSError):
+                    dest.unlink()
+            raise
+        if upload_token:
+            self.discard_temp(upload_token)
+        return doc_id
 
     def update_document(self, doc_id: int, title, category, expires, remind_days, note,
                         tags=None, recur=None) -> None:
@@ -467,6 +549,7 @@ class Store:
                 raise KeyError(cat_id)
             return c.execute("UPDATE documents SET category='other' WHERE category=?", (cat_id,)).rowcount
 
+    @locked
     def delete_document(self, doc_id: int) -> None:
         with self.conn() as c:
             stored = [r["stored"] for r in
@@ -490,27 +573,33 @@ class Store:
             raise ValidationError("err.file_big")
         return name
 
+    @locked
     def _store_file(self, doc_id: int, name: str, move_from: Optional[Path], data: Optional[bytes]) -> int:
         ext = os.path.splitext(name)[1].lower()
         stored = uuid.uuid4().hex + ext
         dest = self.files / stored
-        if move_from is not None:
-            shutil.move(str(move_from), dest)
-        else:
-            dest.write_bytes(data or b"")
-        size = dest.stat().st_size
-        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         try:
+            if move_from is not None:
+                shutil.copyfile(move_from, dest)
+            else:
+                dest.write_bytes(data or b"")
+            size = dest.stat().st_size
+            mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
             with self.conn() as c:
                 cur = c.execute(
                     "INSERT INTO attachments(doc_id,filename,stored,size,mime,added) VALUES(?,?,?,?,?,?)",
                     (doc_id, name, stored, size, mime, _now()))
-                return int(cur.lastrowid)
+                att_id = int(cur.lastrowid)
+            if move_from is not None:
+                with contextlib.suppress(OSError):
+                    move_from.unlink()
+            return att_id
         except BaseException:
             with contextlib.suppress(OSError):
                 dest.unlink()
             raise
 
+    @locked
     def add_attachment(self, doc_id: int, filename: str, data: bytes) -> int:
         name = self.check_upload(filename, len(data))
         if self.get_document(doc_id) is None:
@@ -531,6 +620,7 @@ class Store:
             raise ValueError("invalid file path")
         return path
 
+    @locked
     def delete_attachment(self, att_id: int) -> int:
         with self.conn() as c:
             row = c.execute("SELECT * FROM attachments WHERE id=?", (att_id,)).fetchone()
@@ -542,6 +632,7 @@ class Store:
         return int(row["doc_id"])
 
     # ---- uploads waiting for confirmation ------------------------------------------
+    @locked
     def save_temp(self, filename: str, data: bytes) -> str:
         name = self.check_upload(filename, len(data))
         token = uuid.uuid4().hex
@@ -570,6 +661,7 @@ class Store:
                 json.dumps({"filename": got[1], "text": text[:MAX_BODY]}, ensure_ascii=False),
                 encoding="utf-8")
 
+    @locked
     def temp_to_attachment(self, token: str, doc_id: int) -> int:
         got = self.temp_info(token)
         if got is None:
@@ -580,12 +672,14 @@ class Store:
             (self.tmp / f"{token}.json").unlink()
         return att
 
+    @locked
     def discard_temp(self, token: str) -> None:
         if _TOKEN_RX.match(token or ""):
             for ext in (".bin", ".json"):
                 with contextlib.suppress(OSError):
                     (self.tmp / f"{token}{ext}").unlink()
 
+    @locked
     def cleanup_temp(self, max_age_hours: float = 24) -> None:
         limit = time.time() - max_age_hours * 3600
         for p in self.tmp.iterdir():
@@ -631,25 +725,36 @@ class Store:
                               (it["doc"]["id"], it["doc"]["expires"], t, now))
 
     # ---- backup and restore -----------------------------------------------------------------
+    @locked
     def backup_to(self, dest) -> None:
         """Writes a consistent backup (database + files) to a zip file."""
-        snap = Path(tempfile.mkdtemp(prefix="snap-", dir=self.tmp)) / DB_NAME
+        dest = Path(dest)
+        # Write next to the destination so publishing the finished archive is atomic.
+        fd, part_name = tempfile.mkstemp(prefix=dest.name + ".", suffix=".part", dir=dest.parent)
+        os.close(fd)
+        part = Path(part_name)
+        snap_dir = Path(tempfile.mkdtemp(prefix="snap-", dir=self.tmp))
+        snap = snap_dir / DB_NAME
         try:
-            src = sqlite3.connect(self.db_path, timeout=15)
-            dst = sqlite3.connect(snap)
-            with dst:
+            with contextlib.closing(sqlite3.connect(self.db_path, timeout=15)) as src, \
+                    contextlib.closing(sqlite3.connect(snap)) as dst:
                 src.backup(dst)
-            dst.close()
-            src.close()
-            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+                referenced = [r[0] for r in dst.execute("SELECT stored FROM attachments")]
+            for name in referenced:
+                if not _STORED_RX.fullmatch(f"files/{name}") or not (self.files / name).is_file():
+                    raise OSError(f"Missing or invalid attachment: {name}")
+            with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as z:
                 z.write(snap, DB_NAME)
                 for p in sorted(self.files.iterdir()):
-                    # only files the app stored itself – Thumbs.db, .DS_Store & co. would make the zip unrestorable
                     if p.is_file() and _STORED_RX.fullmatch(f"files/{p.name}"):
                         z.write(p, f"files/{p.name}")
+            os.replace(part, dest)
         finally:
-            shutil.rmtree(snap.parent, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                part.unlink()
+            shutil.rmtree(snap_dir, ignore_errors=True)
 
+    @locked
     def restore_from(self, zip_path) -> Path:
         """Restores a backup. Current data is moved aside into a *-before-restore-* folder."""
         try:
@@ -683,27 +788,58 @@ class Store:
                     if _STORED_RX.fullmatch(n):
                         with z.open(n) as src, open(stage / "files" / n[6:], "wb") as dst:
                             shutil.copyfileobj(src, dst)
-                probe = sqlite3.connect(stage / DB_NAME)
-                try:
+                # Validate the schema before migration, including optional tables when present.
+                with contextlib.closing(sqlite3.connect(stage / DB_NAME)) as probe, \
+                        contextlib.closing(sqlite3.connect(":memory:")) as expected:
+                    expected.executescript(SCHEMA)
                     tables = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                finally:
-                    probe.close()
-                if not {"documents", "attachments"} <= tables:
-                    raise ValidationError("err.restore_struct")
-                stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                    if not {"documents", "attachments"} <= tables:
+                        raise ValidationError("err.restore_struct")
+                    for table in ("documents", "attachments", "settings", "notified", "categories"):
+                        if table not in tables:
+                            continue
+                        required = {r[1] for r in expected.execute(f"PRAGMA table_info({table})")}
+                        if table == "documents":
+                            required -= {name for name, _ in NEW_COLUMNS}
+                        actual = {r[1] for r in probe.execute(f"PRAGMA table_info({table})")}
+                        if not required <= actual:
+                            raise ValidationError("err.restore_struct")
+                    if probe.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                        raise ValidationError("err.restore_corrupt")
+                staged = Store(stage)
+                with staged.conn() as c:
+                    if c.execute("PRAGMA foreign_key_check").fetchone():
+                        raise ValidationError("err.restore_corrupt")
+                    for att in c.execute("SELECT stored,size FROM attachments"):
+                        name = att["stored"]
+                        if not _STORED_RX.fullmatch(f"files/{name}"):
+                            raise ValidationError("err.restore_struct")
+                        path = staged.files / name
+                        if not path.is_file() or path.stat().st_size != att["size"]:
+                            raise ValidationError("err.restore_corrupt")
+                # All staged connections are closed before moving the migrated database.
+                stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                 old = self.dir.parent / f"{self.dir.name}-before-restore-{stamp}"
                 old.mkdir()
-                for item in (DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
-                    if (self.dir / item).exists():
-                        shutil.move(str(self.dir / item), old / item)
-                if self.files.exists():
-                    shutil.move(str(self.files), old / "files")
-                shutil.move(str(stage / DB_NAME), self.dir / DB_NAME)
-                shutil.move(str(stage / "files"), self.files)
+                moves = []
+                try:
+                    for item in (DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm", "files"):
+                        source = self.dir / item
+                        if source.exists():
+                            target = old / item
+                            os.replace(source, target)
+                            moves.append((source, target))
+                    for item in (DB_NAME, "files"):
+                        source, target = stage / item, self.dir / item
+                        os.replace(source, target)
+                        moves.append((source, target))
+                except BaseException:
+                    for source, target in reversed(moves):
+                        os.replace(target, source)
+                    raise
             finally:
                 shutil.rmtree(stage, ignore_errors=True)
         self.files.mkdir(exist_ok=True)
-        self._init_db()                                  # also migrates category ids of old backups
         return old
 
     # ---- automatic backup ------------------------------------------------------------------
@@ -752,6 +888,7 @@ class Store:
             return True
         return now - last >= dt.timedelta(days=cfg["days"]) or last > now
 
+    @locked
     def run_auto_backup(self, force: bool = False, now: Optional[dt.datetime] = None) -> Optional[Path]:
         """Saves a backup into the configured folder if one is due (or force=True), keeps the newest N.
 

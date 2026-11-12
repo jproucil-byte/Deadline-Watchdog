@@ -561,7 +561,7 @@ def _odt_text(path: str) -> str:
 
 
 def _run(cmd: list, timeout: int) -> bytes:
-    return subprocess.run(cmd, capture_output=True, timeout=timeout).stdout
+    return subprocess.run(cmd, capture_output=True, timeout=timeout, check=True).stdout
 
 
 def _note(code: str, **params) -> dict:
@@ -608,7 +608,7 @@ def _ocr_pdf(path: str, psm: int, notes: list, lang: str) -> str:
         prefix = os.path.join(tmp, "p")
         try:
             subprocess.run([pdftoppm, "-r", "200", "-f", "1", "-l", str(OCR_PAGES), "-png", path, prefix],
-                           capture_output=True, timeout=120)
+                           capture_output=True, timeout=120, check=True)
         except (OSError, subprocess.SubprocessError):
             notes.append(_note("pdf_convert_failed"))
             return ""
@@ -638,7 +638,9 @@ def extract_text(path: str, psm: int = 3, name: Optional[str] = None, lang: str 
             method = "pdf"
             if len(text.strip()) < MIN_PDF_TEXT:
                 if find_tool("tesseract") and find_tool("pdftoppm"):
-                    text, method = _ocr_pdf(path, psm, notes, lang), "ocr"
+                    ocr_text = _ocr_pdf(path, psm, notes, lang)
+                    if ocr_text.strip():
+                        text, method = ocr_text, "ocr"
                 else:
                     notes.append(_note("scan_no_tools"))
         elif ext in IMAGE_EXT:

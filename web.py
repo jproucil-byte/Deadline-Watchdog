@@ -670,9 +670,7 @@ def make_handler(app: App):
                 return self.render_review(values, [self.err(e)], None, info[1] if info else "")
             doc_id = app.store.add_document(values["title"], values["category"], values["expires"],
                                             values["remind_days"], values["note"], info[2] if info else "",
-                                            values["tags"], values["recur"])
-            if info:
-                app.store.temp_to_attachment(tmp, doc_id)
+                                            values["tags"], values["recur"], upload_token=tmp)
             self.redirect(f"/doc/{doc_id}?msg=created")
 
         # ---- detail ----------------------------------------------------------------
