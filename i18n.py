@@ -292,6 +292,10 @@ EN = {
     "cli.ab_done": "Automatic backup saved: {path}",
     "cli.sched_removed": "Automatic reminders are off.",
     "cli.sched_test": "Try it now with: watchdog.py notify --test",
+    "bk.missing": ("{n} attached file is missing on disk, so backups can't contain it:",
+                   "{n} attached files are missing on disk, so backups can't contain them:"),
+    "bk.missing_help": "Everything else is backed up normally. Open the document and upload the file again, "
+                       "or delete the file entry there.",
 }
 
 CS = {
@@ -529,6 +533,11 @@ CS = {
     "cli.ab_done": "Automatická záloha uložena: {path}",
     "cli.sched_removed": "Automatická upozornění jsou vypnutá.",
     "cli.sched_test": "Vyzkoušej to hned: watchdog.py notify --test",
+    "bk.missing": ("{n} přiložený soubor chybí na disku, takže v zálohách nebude:",
+                   "{n} přiložené soubory chybí na disku, takže v zálohách nebudou:",
+                   "{n} přiložených souborů chybí na disku, takže v zálohách nebudou:"),
+    "bk.missing_help": "Všechno ostatní se zálohuje normálně. Otevři dokument a nahraj soubor znovu, "
+                       "nebo tam záznam o souboru smaž.",
 }
 
 STRINGS = {"en": EN, "cs": CS}

@@ -41,14 +41,48 @@ class StorageReliability(unittest.TestCase):
         self.assert_original()
         self.assertEqual(list(self.root.glob("data-before-restore-*")), [])
 
-    def test_missing_attachment_rejects_restore(self):
+    def test_backup_with_a_missing_attachment_still_restores(self):
+        """One lost file must not block the backup or the restore of everything else."""
+        second = self.s.add_attachment(self.doc, "second.txt", b"second")
+        lost = self.s.get_attachment(second)["stored"]
+        self.s.attachment_path(self.s.get_attachment(second)).unlink()
+        self.assertEqual([m["filename"] for m in self.s.missing_attachments()], ["second.txt"])
+        archive = self.root / "partial.zip"
+        self.assertEqual(self.s.backup_to(archive), [lost])
+        other = store.Store(self.root / "other")
+        other.restore_from(archive)
+        self.assertEqual([d["title"] for d in other.list_documents()], ["Original"])
+        self.assertEqual([m["filename"] for m in other.missing_attachments()], ["second.txt"])
+        kept = [a for a in other.list_attachments(other.list_documents()[0]["id"]) if a["filename"] == "original.txt"]
+        self.assertEqual(other.attachment_path(kept[0]).read_bytes(), b"original")
+
+    def test_attachment_of_the_wrong_size_rejects_restore(self):
         good, bad = self.root / "good.zip", self.root / "bad.zip"
         self.s.backup_to(good)
         with zipfile.ZipFile(good) as source, zipfile.ZipFile(bad, "w") as target:
-            target.writestr(store.DB_NAME, source.read(store.DB_NAME))
+            for n in source.namelist():
+                target.writestr(n, source.read(n) if n == store.DB_NAME else b"truncated-or-swapped")
         with self.assertRaises(store.ValidationError):
             self.s.restore_from(bad)
         self.assert_original()
+
+    def test_interrupted_automatic_backups_are_cleaned_up(self):
+        import os
+        import time
+        folder = self.root / "bk"
+        folder.mkdir()
+        old = folder / "deadline-watchdog-auto-2026-01-01-100000.zip.part.abc.part"
+        fresh = folder / "deadline-watchdog-auto-2026-01-02-100000.zip.part.def.part"
+        mine = folder / "notes.part"
+        for p in (old, fresh, mine):
+            p.write_bytes(b"x")
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        os.utime(mine, (time.time() - 7200, time.time() - 7200))
+        self.s.set_auto_backup(str(folder), 1, 3)
+        self.s.run_auto_backup(force=True)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())          # may belong to a backup that is running right now
+        self.assertTrue(mine.exists())           # not ours
 
     def test_failed_swap_restores_original_database_and_files(self):
         archive = self.root / "backup.zip"
@@ -106,9 +140,9 @@ class StorageReliability(unittest.TestCase):
         archive = self.root / "backup.zip"
         self.s.backup_to(archive)
         previous = archive.read_bytes()
-        self.s.attachment_path(self.s.get_attachment(self.att)).unlink()
-        with self.assertRaises(OSError):
-            self.s.backup_to(archive)
+        with patch.object(store.zipfile, "ZipFile", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.s.backup_to(archive)
         self.assertEqual(archive.read_bytes(), previous)
         self.assertEqual(list(self.root.glob("*.part")), [])
 

@@ -726,8 +726,20 @@ class Store:
 
     # ---- backup and restore -----------------------------------------------------------------
     @locked
-    def backup_to(self, dest) -> None:
-        """Writes a consistent backup (database + files) to a zip file."""
+    def missing_attachments(self) -> list:
+        """Attachments whose file is no longer on disk: [{'doc_id', 'title', 'filename', 'stored'}]."""
+        with self.conn() as c:
+            rows = c.execute("SELECT a.doc_id, d.title, a.filename, a.stored FROM attachments a "
+                             "JOIN documents d ON d.id=a.doc_id ORDER BY d.title COLLATE NOCASE, a.id").fetchall()
+        return [dict(r) for r in rows
+                if not _STORED_RX.fullmatch(f"files/{r['stored']}") or not (self.files / r["stored"]).is_file()]
+
+    @locked
+    def backup_to(self, dest) -> list:
+        """Writes a consistent backup (database + files) to a zip file.
+
+        A file that has gone missing from disk doesn't stop the backup – everything else is still
+        saved. Returns the stored names of such files (empty list = the backup is complete)."""
         dest = Path(dest)
         # Write next to the destination so publishing the finished archive is atomic.
         fd, part_name = tempfile.mkstemp(prefix=dest.name + ".", suffix=".part", dir=dest.parent)
@@ -740,15 +752,15 @@ class Store:
                     contextlib.closing(sqlite3.connect(snap)) as dst:
                 src.backup(dst)
                 referenced = [r[0] for r in dst.execute("SELECT stored FROM attachments")]
-            for name in referenced:
-                if not _STORED_RX.fullmatch(f"files/{name}") or not (self.files / name).is_file():
-                    raise OSError(f"Missing or invalid attachment: {name}")
+            missing = [name for name in referenced
+                       if not _STORED_RX.fullmatch(f"files/{name}") or not (self.files / name).is_file()]
             with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as z:
                 z.write(snap, DB_NAME)
                 for p in sorted(self.files.iterdir()):
                     if p.is_file() and _STORED_RX.fullmatch(f"files/{p.name}"):
                         z.write(p, f"files/{p.name}")
             os.replace(part, dest)
+            return missing
         finally:
             with contextlib.suppress(OSError):
                 part.unlink()
@@ -815,7 +827,9 @@ class Store:
                         if not _STORED_RX.fullmatch(f"files/{name}"):
                             raise ValidationError("err.restore_struct")
                         path = staged.files / name
-                        if not path.is_file() or path.stat().st_size != att["size"]:
+                        # A file that was already missing when the backup was made is no reason to refuse
+                        # everything else; a file that is there but has the wrong size is damage.
+                        if path.is_file() and path.stat().st_size != att["size"]:
                             raise ValidationError("err.restore_corrupt")
                 # All staged connections are closed before moving the migrated database.
                 stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -903,6 +917,12 @@ class Store:
         part = folder / (dest.name + ".part")
         try:
             folder.mkdir(parents=True, exist_ok=True)
+            stale = time.time() - 3600           # leftovers of a backup that was interrupted (power cut…)
+            for p in folder.iterdir():
+                with contextlib.suppress(OSError):
+                    if (p.is_file() and p.name.startswith(i18n.APP_SLUG + "-auto-") and p.name.endswith(".part")
+                            and p.stat().st_mtime < stale):
+                        p.unlink()
             self.backup_to(part)
             os.replace(part, dest)
             ours = sorted(p for p in folder.iterdir() if p.is_file() and AUTO_BACKUP_RX.match(p.name))

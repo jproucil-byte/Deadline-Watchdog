@@ -882,6 +882,17 @@ def make_handler(app: App):
                 except OSError:
                     pass
 
+        def missing_files_alert(self) -> str:
+            missing = app.store.missing_attachments()
+            if not missing:
+                return ""
+            items = "".join(f'<li><a href="/doc/{m["doc_id"]}">{esc(m["title"])}</a> – {esc(m["filename"])}</li>'
+                            for m in missing[:20])
+            if len(missing) > 20:
+                items += "<li>…</li>"
+            return (f'<div class="alert warn" role="status">{esc(self.TN("bk.missing", len(missing)))}'
+                    f'<ul>{items}</ul><p style="margin:6px 0 0">{self.E("bk.missing_help")}</p></div>')
+
         def get_export(self, query):
             body = f"""{self.flash(query)}<h1>{self.E("export.title")}</h1>
 <div class="card"><h2>{self.E("export.cal_title")}</h2>
@@ -890,7 +901,7 @@ def make_handler(app: App):
 <a class="btn" href="/calendar.ics">{self.E("export.cal_btn")}</a></div>
 {self.schedule_card()}
 <div class="card"><h2>{self.E("export.bk_title")}</h2>
-<p>{self.E("export.bk_text")}</p>
+{self.missing_files_alert()}<p>{self.E("export.bk_text")}</p>
 <pre class="cmd">{esc(scheduler.cli_prefix(app.store.dir))} restore backup.zip --yes</pre>
 <a class="btn secondary" href="/backup.zip">{self.E("export.bk_btn")}</a></div>"""
             self.page(self.T("export.title"), body, "/export")
@@ -996,6 +1007,7 @@ def make_handler(app: App):
                 state = f'<p class="muted">{self.E("set.ab_never")}</p>'
             if cfg["error"]:
                 state += f'<div class="alert err">{self.E("set.ab_error", msg=cfg["error"])}</div>'
+            state += self.missing_files_alert()
             hint = scheduler.suggested_backup_dir()
             tip = f'<br>{self.E("set.ab_suggest", path=hint)}' if hint else ""
             run = (f'<form method="post" action="/settings/backup/run" style="margin-top:10px">{self.csrf()}'

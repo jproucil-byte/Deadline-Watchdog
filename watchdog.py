@@ -126,6 +126,11 @@ def cmd_backup(store: S.Store, args) -> int:
     out = Path(args.file or f"{i18n.APP_SLUG}-backup-{dt.date.today().isoformat()}.zip")
     store.backup_to(out)
     say(i18n.t(lang, "cli.backup", path=out.resolve(), kb=f"{out.stat().st_size / 1024:.0f}"))
+    missing = store.missing_attachments()
+    if missing:
+        say("\n" + i18n.tn(lang, "bk.missing", len(missing)))
+        for m in missing:
+            say(f"  {m['title']} – {m['filename']}")
     return 0
 
 
